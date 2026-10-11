@@ -18,8 +18,6 @@ pub struct AvrState {
     /// sits at that level the exact fraction is reported, so PipeWire sees its own write
     /// echoed unchanged rather than nudged by half-dB rounding.
     requested: Option<(Mv, f64)>,
-    /// Bumped to wake subscribers without changing anything they can see.
-    generation: u64,
 }
 
 impl AvrState {
@@ -89,12 +87,16 @@ impl Shared {
         let mut target = None;
         self.tx.send_if_modified(|s| {
             if !s.active(&self.pc_input) {
-                s.generation += 1;
                 return true;
             }
-            // Clamping here, not just in to_mv, makes an over-cap request echo back as the
-            // cap, so PipeWire's slider settles where the receiver actually is.
-            let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, scale::from_mv(self.cap)) };
+            // Clamp before rounding so that an over-cap request is remembered, and echoed
+            // back, as the cap itself; PipeWire's slider then settles where the receiver
+            // actually is. NaN carries no level, so it is treated as silence.
+            let v = if v.is_nan() {
+                0.0
+            } else {
+                v.clamp(0.0, scale::from_mv(self.cap))
+            };
             let mv = scale::to_mv(v, self.cap);
             s.requested = Some((mv, v));
             target = Some(mv);
@@ -110,9 +112,6 @@ impl Shared {
         let mut active = false;
         self.tx.send_if_modified(|s| {
             active = s.active(&self.pc_input);
-            if !active {
-                s.generation += 1;
-            }
             !active
         });
         active
@@ -195,6 +194,41 @@ mod tests {
         assert!(rx.has_changed().unwrap());
         rx.borrow_and_update();
         assert!(!shared.request_mute());
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn active_mute_request_is_sent_without_notifying() {
+        let shared = on_pc_input();
+        let mut rx = shared.subscribe();
+        rx.borrow_and_update();
+        assert!(shared.request_mute());
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn nan_and_negative_requests_are_silence() {
+        let shared = on_pc_input();
+        assert_eq!(shared.request_volume(f64::NAN), Some(Mv::ZERO));
+        assert_eq!(shared.request_volume(-0.5), Some(Mv::ZERO));
+    }
+
+    #[test]
+    fn levels_above_the_cap_read_back_as_they_are() {
+        let shared = on_pc_input();
+        shared.apply(Event::Volume(Mv::from_whole(75)));
+        assert_eq!(shared.snapshot().volume(), Some(0.75));
+    }
+
+    #[test]
+    fn real_changes_notify() {
+        let shared = on_pc_input();
+        let mut rx = shared.subscribe();
+        rx.borrow_and_update();
+        shared.apply(Event::Volume(Mv::from_whole(50)));
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        shared.set_connected(false);
         assert!(rx.has_changed().unwrap());
     }
 
