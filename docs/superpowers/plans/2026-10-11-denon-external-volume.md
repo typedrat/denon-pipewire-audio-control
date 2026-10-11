@@ -445,11 +445,12 @@ git commit -m "Add MV type and PipeWire volume mapping"
 - Consumes: `scale::Mv` (`Mv::parse`, `Display`).
 - Produces:
   - `pub const PORT: u16 = 23`
-  - `pub const QUERIES: [&str; 4]`, each ending in `\r`
+  - `pub const QUERIES: [&str; 4]` (bare lines; the sender appends the terminator)
   - `pub const HEARTBEAT: &str`
   - `pub enum Event { Power(bool), Input(String), Volume(Mv), Mute(bool) }` (Debug, Clone, PartialEq, Eq)
   - `pub fn parse_line(&str) -> Option<Event>`
-  - `pub enum Command { Volume(Mv), Mute(bool) }` (Debug, Clone, Copy, PartialEq, Eq) with `fn wire(self) -> String`
+  - `pub enum Command { Volume(Mv), Mute(bool) }` (Debug, Clone, Copy, PartialEq, Eq) with `impl Display` giving the bare line (`MV62`, `MUON`)
+  - `pub const TERMINATOR: char = '\r'`
   - `pub struct LineBuffer` (Default) with `fn push(&mut self, &[u8]) -> Vec<String>`
 
 - [ ] **Step 1: Write the failing tests** in `protocol.rs`
@@ -483,10 +484,10 @@ mod tests {
 
     #[test]
     fn formats_commands() {
-        assert_eq!(Command::Volume(Mv::from_whole(62)).wire(), "MV62\r");
-        assert_eq!(Command::Volume(Mv::from_half_steps(121)).wire(), "MV605\r");
-        assert_eq!(Command::Mute(true).wire(), "MUON\r");
-        assert_eq!(Command::Mute(false).wire(), "MUOFF\r");
+        assert_eq!(Command::Volume(Mv::from_whole(62)).to_string(), "MV62");
+        assert_eq!(Command::Volume(Mv::from_half_steps(121)).to_string(), "MV605");
+        assert_eq!(Command::Mute(true).to_string(), "MUON");
+        assert_eq!(Command::Mute(false).to_string(), "MUOFF");
     }
 
     #[test]
@@ -511,16 +512,21 @@ Expected: compile errors (the items are not defined).
 ```rust
 //! The Denon AVR telnet control protocol: `\r`-terminated ASCII lines on TCP port 23.
 
+use std::fmt;
+
 use crate::scale::Mv;
 
 pub const PORT: u16 = 23;
 
 /// Sent after connecting so the state is known without waiting for something to change.
-pub const QUERIES: [&str; 4] = ["ZM?\r", "SI?\r", "MV?\r", "MU?\r"];
+/// Ends every line in both directions.
+pub const TERMINATOR: char = '\r';
+
+pub const QUERIES: [&str; 4] = ["ZM?", "SI?", "MV?", "MU?"];
 
 /// Sent periodically: a TCP write is the only way to notice a receiver that dropped off the
 /// network without closing the connection.
-pub const HEARTBEAT: &str = "ZM?\r";
+pub const HEARTBEAT: &str = "ZM?";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -556,12 +562,12 @@ pub enum Command {
     Mute(bool),
 }
 
-impl Command {
-    pub fn wire(self) -> String {
+impl fmt::Display for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Command::Volume(mv) => format!("MV{mv}\r"),
-            Command::Mute(true) => "MUON\r".to_owned(),
-            Command::Mute(false) => "MUOFF\r".to_owned(),
+            Command::Volume(mv) => write!(f, "MV{mv}"),
+            Command::Mute(true) => f.write_str("MUON"),
+            Command::Mute(false) => f.write_str("MUOFF"),
         }
     }
 }
@@ -576,7 +582,7 @@ impl LineBuffer {
     pub fn push(&mut self, data: &[u8]) -> Vec<String> {
         self.pending.extend_from_slice(data);
         let mut lines = Vec::new();
-        while let Some(end) = self.pending.iter().position(|&b| b == b'\r') {
+        while let Some(end) = self.pending.iter().position(|&b| b == TERMINATOR as u8) {
             let line: Vec<u8> = self.pending.drain(..=end).collect();
             let text = String::from_utf8_lossy(&line[..end]).trim().to_owned();
             if !text.is_empty() {
@@ -872,7 +878,7 @@ git commit -m "Add shared receiver state with input gating"
 - Modify: `crates/denon-volume/src/lib.rs` (add `pub mod avr;` and `pub mod discovery;`)
 
 **Interfaces:**
-- Consumes: `protocol::{Command, LineBuffer, parse_line, QUERIES, HEARTBEAT}`, `state::Shared`, `discovery::find(Option<&str>, Duration) -> anyhow::Result<Ipv4Addr>`.
+- Consumes: `protocol::{Command, LineBuffer, parse_line, QUERIES, HEARTBEAT, TERMINATOR}`, `state::Shared`, `discovery::find(Option<&str>, Duration) -> anyhow::Result<Ipv4Addr>`.
 - Produces:
   - `pub struct Outbox` (Default) with `push(&self, Command)`, `take(&self) -> Option<Command>`, `async next(&self) -> Command`, `clear(&self)`
   - `pub enum Target { Host(String), Discover { selector: Option<String> } }`
@@ -982,7 +988,8 @@ mod tests {
             let (mut sock, _) = listener.accept().await.unwrap();
             let sent = read_until(&mut sock, "MU?\r").await;
             for query in QUERIES {
-                assert!(sent.contains(query), "missing {query:?} in {sent:?}");
+                let line = format!("{query}\r");
+                assert!(sent.contains(&line), "missing {line:?} in {sent:?}");
             }
             sock.write_all(b"ZMON\rSIBD\rMV62\rMVMAX 98\rMUOFF\r")
                 .await
@@ -1045,18 +1052,21 @@ Expected: compile errors.
 ```rust
 //! The telnet session with the receiver.
 
+use std::fmt;
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::WriteHalf;
 use tokio::sync::Notify;
 use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::discovery;
-use crate::protocol::{self, Command, HEARTBEAT, LineBuffer, QUERIES};
+use crate::protocol::{self, HEARTBEAT, LineBuffer, QUERIES, TERMINATOR};
 use crate::scale::Mv;
 use crate::state::Shared;
 
@@ -1168,7 +1178,7 @@ async fn connect(config: &ConnectConfig) -> anyhow::Result<TcpStream> {
 async fn session(mut stream: TcpStream, shared: &Shared, outbox: &Outbox) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.split();
     for query in QUERIES {
-        writer.write_all(query.as_bytes()).await?;
+        send(&mut writer, query).await?;
         time::sleep(COMMAND_SPACING).await;
     }
 
@@ -1191,14 +1201,20 @@ async fn session(mut stream: TcpStream, shared: &Shared, outbox: &Outbox) -> any
             }
             command = outbox.next() => {
                 debug!(?command, "to receiver");
-                writer.write_all(command.wire().as_bytes()).await?;
+                send(&mut writer, command).await?;
                 time::sleep(COMMAND_SPACING).await;
             }
             _ = heartbeat.tick() => {
-                writer.write_all(HEARTBEAT.as_bytes()).await?;
+                send(&mut writer, HEARTBEAT).await?;
             }
         }
     }
+}
+
+async fn send(writer: &mut WriteHalf<'_>, line: impl fmt::Display) -> io::Result<()> {
+    writer
+        .write_all(format!("{line}{TERMINATOR}").as_bytes())
+        .await
 }
 ```
 
