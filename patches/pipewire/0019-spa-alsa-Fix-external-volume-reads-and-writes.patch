@@ -1,4 +1,4 @@
-From 0af8a6fb05af5e9bfe588fa904d5ffa04c158822 Mon Sep 17 00:00:00 2001
+From 8c5a8e0c227c25bb1153e22b82d1bee069c6b5ec Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:35:14 -0700
 Subject: [PATCH 19/20] spa: alsa: Fix external volume reads and writes
@@ -16,8 +16,11 @@ compacts its buffer so long-lived connections don't overflow it.
 Reply callbacks may make new calls or destroy the client. Writes use
 MSG_NOSIGNAL and never leave half a message on the socket: a write
 that would block is dropped with -EAGAIN, and one cut short
-disconnects. A sync call that times out or fails disconnects, so a
-late reply can't be taken as the answer to the next call.
+disconnects. Sync calls send with MSG_DONTWAIT so a peer that stops
+reading can't block the caller, and a sync call that times out or
+fails disconnects, so a late reply can't be taken as the answer to
+the next call. Connect failures report the real errno and log at
+debug level, leaving it to callers how loudly to report them.
 
 The client also refuses calls once disconnected instead of writing to
 a closed fd, reads replies sent just before a hangup, honours
@@ -25,12 +28,27 @@ sync-call timeouts of a second or more, closes the socket when connect
 fails, and frees destroyed clients, which impl_clear otherwise loops on
 forever.
 ---
+ spa/include/spa/support/varlink.h |   3 +-
  spa/plugins/alsa/acp/acp.c        |  17 +-
- spa/plugins/alsa/acp/ext-volume.c | 192 +++++++++++----------
+ spa/plugins/alsa/acp/ext-volume.c | 192 ++++++++++----------
  spa/plugins/alsa/acp/ext-volume.h |   2 +-
- spa/plugins/support/varlink.c     | 268 ++++++++++++++++++++----------
- 4 files changed, 286 insertions(+), 193 deletions(-)
+ spa/plugins/support/varlink.c     | 290 ++++++++++++++++++++----------
+ 5 files changed, 303 insertions(+), 201 deletions(-)
 
+diff --git a/spa/include/spa/support/varlink.h b/spa/include/spa/support/varlink.h
+index 9031d3d..78c6c0a 100644
+--- a/spa/include/spa/support/varlink.h
++++ b/spa/include/spa/support/varlink.h
+@@ -41,7 +41,8 @@ struct spa_varlink_client_events {
+ 	/** The client was destroyed. */
+ 	void (*destroy) (void *data);
+ 
+-	/** The client was disconnected. */
++	/** The client was disconnected. Listeners must not destroy the client
++	 * synchronously from this callback. */
+ 	void (*disconnect) (void *data);
+ };
+ 
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
 index a41c216..47943b4 100644
 --- a/spa/plugins/alsa/acp/acp.c
@@ -369,7 +387,7 @@ index 6879ad3..ed026cd 100644
  int spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
  		const char *device, const char *route, float step);
 diff --git a/spa/plugins/support/varlink.c b/spa/plugins/support/varlink.c
-index 99b5025..4fa2352 100644
+index 99b5025..fc9ab10 100644
 --- a/spa/plugins/support/varlink.c
 +++ b/spa/plugins/support/varlink.c
 @@ -2,10 +2,12 @@
@@ -404,14 +422,14 @@ index 99b5025..4fa2352 100644
 + * leaves the peer mid-message, so the connection is dropped if the rest can't
 + * be sent. */
 +static int
-+send_message(struct client *this, const char *buf, size_t len)
++send_message(struct client *this, const char *buf, size_t len, int flags)
 +{
 +	struct impl *impl = this->impl;
 +	size_t pos = 0;
 +	ssize_t res;
 +
 +	while (pos < len) {
-+		res = send(this->fd, &buf[pos], len - pos, MSG_NOSIGNAL);
++		res = send(this->fd, &buf[pos], len - pos, MSG_NOSIGNAL | flags);
 +		if (res > 0) {
 +			pos += res;
 +			continue;
@@ -468,7 +486,7 @@ index 99b5025..4fa2352 100644
 -		pos += res;
 -	} while ((res > 0 && len >= pos) || res == -EAGAIN || res == -EWOULDBLOCK);
 -
-+	res = send_message(this, buf, len + 1);
++	res = send_message(this, buf, len + 1, 0);
  	free(buf);
 -
 -	if (res < 0) {
@@ -497,7 +515,7 @@ index 99b5025..4fa2352 100644
  		spa_log_error(impl->log, "Invalid state for sync call");
  		res = -EINVAL;
  	}
-@@ -175,26 +218,21 @@ client_call_sync(void *object, const char *method, const char *params,
+@@ -175,26 +218,23 @@ client_call_sync(void *object, const char *method, const char *params,
  
  	fcntl(this->fd, F_SETFL, fcntl(this->fd, F_GETFL) & ~O_NONBLOCK);
  	if (timeout >= 0) {
@@ -518,7 +536,9 @@ index 99b5025..4fa2352 100644
 -		pos += res;
 -	} while (res > 0 && len >= pos);
  
-+	res = send_message(this, buf, len + 1);
++	/* The socket is blocking here; a peer that stops reading must not
++	 * stall the caller. */
++	res = send_message(this, buf, len + 1, MSG_DONTWAIT);
  	free(buf);
 -
 -	if (res < 0) {
@@ -530,7 +550,7 @@ index 99b5025..4fa2352 100644
  
  	while (true) {
  		size_t eom;
-@@ -205,15 +243,29 @@ client_call_sync(void *object, const char *method, const char *params,
+@@ -205,15 +245,29 @@ client_call_sync(void *object, const char *method, const char *params,
  			if (res == -EINTR)
  				continue;
  
@@ -560,7 +580,7 @@ index 99b5025..4fa2352 100644
  		for (eom = 0; eom < this->avail; eom++) {
  			if (this->buf[eom] == '\0')
  				break;
-@@ -236,10 +288,12 @@ client_call_sync(void *object, const char *method, const char *params,
+@@ -236,10 +290,12 @@ client_call_sync(void *object, const char *method, const char *params,
  	}
  
  done:
@@ -576,7 +596,7 @@ index 99b5025..4fa2352 100644
  
  	return res;
  }
-@@ -260,12 +314,18 @@ client_disconnect(struct client *this)
+@@ -260,12 +316,18 @@ client_disconnect(struct client *this)
  
  static void do_destroy(struct client *client)
  {
@@ -595,7 +615,7 @@ index 99b5025..4fa2352 100644
  }
  
  static void
-@@ -282,36 +342,36 @@ process_message(struct client *this, const char *msg, size_t len)
+@@ -282,36 +344,36 @@ process_message(struct client *this, const char *msg, size_t len)
  	struct spa_json json;
  	char key[64];
  	const char *val, *error = NULL, *params = NULL;
@@ -648,7 +668,7 @@ index 99b5025..4fa2352 100644
  	if (!this->more_pending || !continues) {
  		/* We didn't ask for more, but server might send */
  		if (continues)
-@@ -323,84 +383,107 @@ process_message(struct client *this, const char *msg, size_t len)
+@@ -323,84 +385,107 @@ process_message(struct client *this, const char *msg, size_t len)
  		this->cb_userdata = NULL;
  	}
  
@@ -768,15 +788,20 @@ index 99b5025..4fa2352 100644
 +		}
 +	}
 +}
-+
+ 
+-		/* Consume message so far and NUL terminator */
+-		this->pos = eom + 1;
 +static void
 +client_on_reply(void *userdata, int fd, uint32_t mask)
 +{
 +	struct client *this = (struct client *)userdata;
 +	struct impl *impl = this->impl;
  
--		/* Consume message so far and NUL terminator */
--		this->pos = eom + 1;
+-		if (this->pos == this->avail) {
+-			/* All data has been consumed, reset */
+-			this->pos = this->avail = 0;
+-			break;
+-		}
 +	/* Read first, so replies sent just before a hangup are still seen */
 +	if (mask & SPA_IO_IN) {
 +		spa_log_debug(impl->log, "Ready to read");
@@ -784,17 +809,12 @@ index 99b5025..4fa2352 100644
 +			return;
 +	}
  
--		if (this->pos == this->avail) {
--			/* All data has been consumed, reset */
--			this->pos = this->avail = 0;
--			break;
--		}
 +	if (mask & SPA_IO_HUP) {
 +		spa_log_info(impl->log, "Got hangup event");
 +		client_disconnect(this);
 +		return;
 +	}
- 
++
 +	if (mask & SPA_IO_ERR) {
 +		spa_log_info(impl->log, "Got error event");
 +		client_disconnect(this);
@@ -802,7 +822,7 @@ index 99b5025..4fa2352 100644
  	}
  }
  
-@@ -425,6 +508,7 @@ impl_connect(void *object, const char *path)
+@@ -425,32 +510,38 @@ impl_connect(void *object, const char *path)
  	client = calloc(1, sizeof(struct client));
  	if (client == NULL)
  		return NULL;
@@ -810,7 +830,53 @@ index 99b5025..4fa2352 100644
  
  	socket_path = varlink_parse_path(path, &transport);
  	/* We only support UNIX sockets for now */
-@@ -480,6 +564,8 @@ impl_connect(void *object, const char *path)
++	/* Failures are logged at debug level and reported through errno:
++	 * callers that retry decide how loudly to report them. */
+ 	if (socket_path == NULL || transport != SPA_VARLINK_TRANSPORT_UNIX) {
+-		spa_log_error(this->log, "Could not connect to socket path '%s'",
++		res = -EINVAL;
++		spa_log_debug(this->log, "Could not connect to socket path '%s'",
+ 				path);
+ 		goto error;
+ 	}
+ 
+ 	client->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+ 	if (client->fd < 0) {
+-		spa_log_error(this->log, "Could not create socket %s",
++		res = -errno;
++		spa_log_debug(this->log, "Could not create socket: %s",
+ 				spa_strerror(res));
+ 		goto error;
+ 	}
+ 
+ 	sa.sun_family = AF_UNIX;
+ 	res = snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", socket_path);
+-	if (res < 0 || res > (int) sizeof(sa.sun_path)) {
+-		spa_log_error(this->log, "Socket path too long: %s", socket_path);
++	if (res < 0 || res >= (int) sizeof(sa.sun_path)) {
++		res = -ENAMETOOLONG;
++		spa_log_debug(this->log, "Socket path too long: %s", socket_path);
+ 		goto error;
+ 	}
+ 
+-	res = connect(client->fd, (struct sockaddr *)&sa, sizeof(sa));
+-	if (res < 0) {
+-		spa_log_error(this->log, "Could not open socket %s: %s",
++	if (connect(client->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
++		res = -errno;
++		spa_log_debug(this->log, "Could not open socket %s: %s",
+ 				socket_path, spa_strerror(res));
+ 		goto error;
+ 	}
+@@ -469,6 +560,7 @@ impl_connect(void *object, const char *path)
+ 			SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, false,
+ 			client_on_reply, client);
+ 	if (client->source == NULL) {
++		res = errno > 0 ? -errno : -ENOMEM;
+ 		spa_log_error(this->log, "Could not create source");
+ 		goto error;
+ 	}
+@@ -480,6 +572,8 @@ impl_connect(void *object, const char *path)
  	return &client->client;
  
  error:

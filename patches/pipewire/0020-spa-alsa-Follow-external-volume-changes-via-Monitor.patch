@@ -1,4 +1,4 @@
-From 3c7e640a49d6cafda5eb053e5ea1d87ee2ef14d1 Mon Sep 17 00:00:00 2001
+From 25c78d00f1a410ed6c6349a0fbf3aa8bcd0eef02 Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:36:59 -0700
 Subject: [PATCH 20/20] spa: alsa: Follow external volume changes via Monitor
@@ -8,21 +8,26 @@ applies the pushed volume and mute to the active route, so changes
 made on the device itself show up in PipeWire.
 
 If the service is unreachable when the card comes up, or goes away
-later, both connections are retried on a 1 s timer. A replacement is
-swapped in only once it connects, so calls fail meanwhile instead of
-falling through to the card's own mixer. Capabilities learned on a
-late connect install the devices' volume and mute hooks then. A
-Monitor stream that ends is restarted, backing off up to 30 s while
-the service keeps refusing it.
+later, both connections are retried on a timer, starting at 1 s and
+backing off to 30 s. The main connection and Monitor back off
+separately, so a service that keeps refusing Monitor doesn't delay
+reconnecting the main connection. Losing the service is logged once,
+retries quietly, and recovery once.
+
+A replacement connection is swapped in only once it works, so calls
+fail meanwhile instead of falling through to the card's own mixer.
+Capabilities learned on a late connect install the devices' volume
+and mute hooks then and drop any software volume applied before. A
+Monitor stream that ends is restarted.
 ---
- spa/plugins/alsa/acp/acp.c         | 131 +++++++++++--
- spa/plugins/alsa/acp/ext-volume.c  | 283 +++++++++++++++++++++++++++--
- spa/plugins/alsa/acp/ext-volume.h  |  33 +++-
+ spa/plugins/alsa/acp/acp.c         | 135 ++++++++++--
+ spa/plugins/alsa/acp/ext-volume.c  | 319 +++++++++++++++++++++++++++--
+ spa/plugins/alsa/acp/ext-volume.h  |  36 +++-
  spa/plugins/alsa/alsa-acp-device.c |   2 +
- 4 files changed, 410 insertions(+), 39 deletions(-)
+ 4 files changed, 452 insertions(+), 40 deletions(-)
 
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
-index 47943b4..6dc188a 100644
+index 47943b4..f6325b1 100644
 --- a/spa/plugins/alsa/acp/acp.c
 +++ b/spa/plugins/alsa/acp/acp.c
 @@ -22,6 +22,7 @@ void *_acp_log_data;
@@ -33,7 +38,7 @@ index 47943b4..6dc188a 100644
  
  #define DEFAULT_CHANNELS	255u
  #define DEFAULT_RATE		48000u
-@@ -1250,6 +1251,104 @@ static void init_eld_ctls(pa_card *impl)
+@@ -1250,6 +1251,108 @@ static void init_eld_ctls(pa_card *impl)
  	}
  }
  
@@ -113,6 +118,9 @@ index 47943b4..6dc188a 100644
 +	dev->device.ext_volume_flags = impl->card.ext_volume.flags;
 +	mixer_volume_init(impl, dev);
 +
++	/* Drop software attenuation applied while volume was unmanaged */
++	pa_cvolume_reset(&dev->soft_volume, dev->device.format.channels);
++
 +	if (dev->read_volume)
 +		dev->read_volume(dev);
 +	if (dev->read_mute)
@@ -131,6 +139,7 @@ index 47943b4..6dc188a 100644
 +	pa_alsa_device *dev;
 +	uint32_t idx;
 +
++	/* out.devices holds capture devices too */
 +	PA_DYNARRAY_FOREACH(dev, &impl->out.devices, idx)
 +		ext_volume_ready_device(impl, dev);
 +}
@@ -138,7 +147,7 @@ index 47943b4..6dc188a 100644
  static void init_ext_volume(pa_card *impl)
  {
  	struct acp_card *card = &impl->card;
-@@ -1259,8 +1358,8 @@ static void init_ext_volume(pa_card *impl)
+@@ -1259,8 +1362,8 @@ static void init_ext_volume(pa_card *impl)
  		return;
  
  	/* Called for every enabled device, but the service connection is
@@ -149,7 +158,7 @@ index 47943b4..6dc188a 100644
  		return;
  
  	if (!acp_varlink) {
-@@ -1268,7 +1367,9 @@ static void init_ext_volume(pa_card *impl)
+@@ -1268,7 +1371,9 @@ static void init_ext_volume(pa_card *impl)
  		return;
  	}
  
@@ -160,7 +169,7 @@ index 47943b4..6dc188a 100644
  	if (res < 0)
  		spa_acp_ext_volume_destroy(&card->ext_volume);
  }
-@@ -1395,18 +1496,8 @@ static int read_volume(pa_alsa_device *dev)
+@@ -1395,18 +1500,8 @@ static int read_volume(pa_alsa_device *dev)
  			return 0;
  		}
  
@@ -181,7 +190,7 @@ index 47943b4..6dc188a 100644
  	} else if (dev->mixer_handle) {
  		/* ALSA mixer for volume */
  		if (dev->mixer_path->has_volume_mute && dev->muted) {
-@@ -1469,9 +1560,10 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+@@ -1469,9 +1564,10 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
  				return;
  			}
  
@@ -195,7 +204,7 @@ index 47943b4..6dc188a 100644
  		} else if ((impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_READ_VOLUME) &&
  				(impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_WRITE_VOLUME_UPDOWN)) {
  			/* External volume control by increment/decrement only */
-@@ -1577,6 +1669,9 @@ static int read_mute(pa_alsa_device *dev)
+@@ -1577,6 +1673,9 @@ static int read_mute(pa_alsa_device *dev)
  			pa_log_error("Could not read mute state");
  			return 0;
  		}
@@ -206,7 +215,7 @@ index 47943b4..6dc188a 100644
  		/* ALSA mixer for mute state */
  		if (dev->mixer_path->has_volume_mute) {
 diff --git a/spa/plugins/alsa/acp/ext-volume.c b/spa/plugins/alsa/acp/ext-volume.c
-index d64a660..066f66d 100644
+index d64a660..e2ac856 100644
 --- a/spa/plugins/alsa/acp/ext-volume.c
 +++ b/spa/plugins/alsa/acp/ext-volume.c
 @@ -2,6 +2,10 @@
@@ -220,7 +229,7 @@ index d64a660..066f66d 100644
  #include <spa/support/varlink.h>
  #include <spa/utils/cleanup.h>
  #include <spa/utils/json.h>
-@@ -21,12 +25,42 @@
+@@ -21,12 +25,59 @@
  #define METHOD_READ_MUTE VOLUME_CONTROL_BASE "ReadMute"
  #define METHOD_WRITE_MUTE_VALUE VOLUME_CONTROL_BASE "WriteMuteValue"
  #define METHOD_WRITE_MUTE_TOGGLE VOLUME_CONTROL_BASE "WriteMuteToggle"
@@ -230,18 +239,31 @@ index d64a660..066f66d 100644
 +#define RECONNECT_MSEC 1000
 +#define RECONNECT_MAX_MSEC 30000
 +
-+static void schedule_reconnect(struct spa_acp_ext_volume *ext_volume)
++/* The main connection and Monitor back off separately, so a Monitor that
++ * keeps failing doesn't hold up reconnecting the main connection. Both share
++ * one timer, armed with the shortest delay requested since it last fired. */
++static void schedule_reconnect(struct spa_acp_ext_volume *ext_volume, uint32_t msec)
 +{
 +	struct timespec value = {
-+		.tv_sec = ext_volume->reconnect_msec / 1000,
-+		.tv_nsec = (ext_volume->reconnect_msec % 1000) * SPA_NSEC_PER_MSEC,
++		.tv_sec = msec / 1000,
++		.tv_nsec = (msec % 1000) * SPA_NSEC_PER_MSEC,
 +	};
 +
-+	if (ext_volume->loop_utils && ext_volume->reconnect_timer)
-+		spa_loop_utils_update_timer(ext_volume->loop_utils,
-+				ext_volume->reconnect_timer, &value, NULL, false);
++	if (!ext_volume->loop_utils || !ext_volume->reconnect_timer)
++		return;
++	if (ext_volume->pending_msec && ext_volume->pending_msec <= msec)
++		return;
++
++	ext_volume->pending_msec = msec;
++	spa_loop_utils_update_timer(ext_volume->loop_utils,
++			ext_volume->reconnect_timer, &value, NULL, false);
 +}
  
++static uint32_t backoff(uint32_t msec)
++{
++	return SPA_MIN(msec * 2, (uint32_t)RECONNECT_MAX_MSEC);
++}
++
 +/* Clients can't be torn down from inside their own callbacks, so
 + * reconnecting happens on a timer. */
  static void client_disconnect(void *userdata)
@@ -249,22 +271,26 @@ index d64a660..066f66d 100644
 -	/* TODO: reconnect? bail? */
 +	struct spa_acp_ext_volume *ext_volume = userdata;
 +
-+	pa_log_warn("Lost connection to external volume control at %s", ext_volume->path);
++	if (!ext_volume->unreachable)
++		pa_log_warn("Lost connection to external volume control at %s",
++				ext_volume->path);
++	ext_volume->unreachable = true;
 +	ext_volume->connected = false;
-+	schedule_reconnect(ext_volume);
++	schedule_reconnect(ext_volume, ext_volume->connect_msec);
 +}
 +
 +static void monitor_disconnect(void *userdata)
 +{
 +	struct spa_acp_ext_volume *ext_volume = userdata;
 +
-+	pa_log_warn("Lost external volume monitor at %s", ext_volume->path);
++	/* The main connection reports the service going away */
++	pa_log_debug("Lost external volume monitor at %s", ext_volume->path);
 +	ext_volume->monitoring = false;
-+	schedule_reconnect(ext_volume);
++	schedule_reconnect(ext_volume, ext_volume->monitor_msec);
  }
  
  static void client_destroy(void *userdata)
-@@ -39,6 +73,11 @@ static struct spa_varlink_client_events client_events = {
+@@ -39,6 +90,11 @@ static struct spa_varlink_client_events client_events = {
  	.destroy = client_destroy,
  };
  
@@ -276,7 +302,7 @@ index d64a660..066f66d 100644
  /* Points params at the reply's "parameters" object and returns its length,
   * or a negative errno for an error reply. */
  static int reply_parameters(const char *reply, int len, const char **params)
-@@ -119,9 +158,68 @@ static int parse_mute(const char *params, int len, bool *mute)
+@@ -119,9 +175,67 @@ static int parse_mute(const char *params, int len, bool *mute)
  	return -ENOENT;
  }
  
@@ -297,19 +323,18 @@ index d64a660..066f66d 100644
 +	if (error) {
 +		pa_log_error("External volume monitor failed: %.*s", (int)len, error);
 +		ext_volume->monitoring = false;
-+		schedule_reconnect(ext_volume);
++		schedule_reconnect(ext_volume, ext_volume->monitor_msec);
 +		/* Back off from a service that keeps refusing Monitor */
-+		ext_volume->reconnect_msec = SPA_MIN(ext_volume->reconnect_msec * 2,
-+				(uint32_t)RECONNECT_MAX_MSEC);
++		ext_volume->monitor_msec = backoff(ext_volume->monitor_msec);
 +		return;
 +	}
 +
-+	ext_volume->reconnect_msec = RECONNECT_MSEC;
++	ext_volume->monitor_msec = RECONNECT_MSEC;
 +
 +	if (!continues) {
 +		pa_log_warn("External volume monitor ended");
 +		ext_volume->monitoring = false;
-+		schedule_reconnect(ext_volume);
++		schedule_reconnect(ext_volume, ext_volume->monitor_msec);
 +	}
 +
 +	if (!params || !ext_volume->changed)
@@ -348,7 +373,7 @@ index d64a660..066f66d 100644
  {
  	struct spa_json_builder params_json;
  	struct spa_json reply_json;
-@@ -132,27 +230,16 @@ spa_acp_ext_volume_init(struct spa_acp_ext_volume *ext_volume, struct spa_varlin
+@@ -132,30 +246,19 @@ spa_acp_ext_volume_init(struct spa_acp_ext_volume *ext_volume, struct spa_varlin
  	size_t len;
  	int res;
  
@@ -377,8 +402,12 @@ index d64a660..066f66d 100644
 +	res = spa_varlink_client_call_sync(client, METHOD_GET_CAPABILITIES, params, &reply, 2000);
  
  	if (res < 0) {
- 		pa_log_error("Failed to query volume control capabilities: %s", spa_strerror(res));
-@@ -207,13 +294,169 @@ done:
+-		pa_log_error("Failed to query volume control capabilities: %s", spa_strerror(res));
++		pa_log_debug("Failed to query volume control capabilities: %s", spa_strerror(res));
+ 		return res;
+ 	}
+ 
+@@ -207,13 +310,187 @@ done:
  	return res;
  }
  
@@ -400,7 +429,7 @@ index d64a660..066f66d 100644
 +
 +	client = spa_varlink_connect(ext_volume->varlink, ext_volume->path);
 +	if (!client)
-+		return -ECONNREFUSED;
++		return errno > 0 ? -errno : -ECONNREFUSED;
 +
 +	if (ext_volume->flags == 0 && (res = get_capabilities(ext_volume, client)) < 0) {
 +		spa_varlink_client_destroy(client);
@@ -414,6 +443,7 @@ index d64a660..066f66d 100644
  	}
 +	ext_volume->client = client;
 +	ext_volume->connected = true;
++	ext_volume->connect_msec = RECONNECT_MSEC;
 +	spa_varlink_client_add_listener(client, &ext_volume->listener,
 +			&client_events, ext_volume);
 +
@@ -432,7 +462,7 @@ index d64a660..066f66d 100644
 +
 +	client = spa_varlink_connect(ext_volume->varlink, ext_volume->path);
 +	if (!client)
-+		return -ECONNREFUSED;
++		return errno > 0 ? -errno : -ECONNREFUSED;
 +
 +	spa_json_builder_memstream(&params_json, &params, &len, 0);
 +	spa_json_builder_object_push(&params_json, NULL, "{");
@@ -465,14 +495,25 @@ index d64a660..066f66d 100644
 +	bool had_flags = ext_volume->flags != 0;
 +	int res;
 +
++	ext_volume->pending_msec = 0;
++
 +	if (!ext_volume->connected) {
 +		if ((res = connect_client(ext_volume)) < 0) {
-+			pa_log_debug("Could not reconnect to %s: %s", ext_volume->path,
-+					spa_strerror(res));
-+			schedule_reconnect(ext_volume);
++			/* Warned when the service went away; stay quiet until it's back */
++			if (!ext_volume->unreachable)
++				pa_log_warn("Could not reach external volume control at %s: %s",
++						ext_volume->path, spa_strerror(res));
++			else
++				pa_log_debug("Could not reconnect to %s: %s", ext_volume->path,
++						spa_strerror(res));
++			ext_volume->unreachable = true;
++			schedule_reconnect(ext_volume, ext_volume->connect_msec);
++			ext_volume->connect_msec = backoff(ext_volume->connect_msec);
 +			return;
 +		}
-+		pa_log_info("Connected to external volume control at %s", ext_volume->path);
++		if (ext_volume->unreachable)
++			pa_log_info("Reconnected to external volume control at %s", ext_volume->path);
++		ext_volume->unreachable = false;
 +
 +		if (!had_flags && ext_volume->flags && ext_volume->ready)
 +			ext_volume->ready(ext_volume->data);
@@ -482,7 +523,8 @@ index d64a660..066f66d 100644
 +		if ((res = start_monitor(ext_volume)) < 0) {
 +			pa_log_debug("Could not restart monitor at %s: %s", ext_volume->path,
 +					spa_strerror(res));
-+			schedule_reconnect(ext_volume);
++			schedule_reconnect(ext_volume, ext_volume->monitor_msec);
++			ext_volume->monitor_msec = backoff(ext_volume->monitor_msec);
 +		}
 +	}
 +}
@@ -504,7 +546,8 @@ index d64a660..066f66d 100644
 +	ext_volume->changed = changed;
 +	ext_volume->ready = ready;
 +	ext_volume->data = data;
-+	ext_volume->reconnect_msec = RECONNECT_MSEC;
++	ext_volume->connect_msec = RECONNECT_MSEC;
++	ext_volume->monitor_msec = RECONNECT_MSEC;
 +
 +	if (loop_utils)
 +		ext_volume->reconnect_timer = spa_loop_utils_add_timer(loop_utils,
@@ -518,15 +561,17 @@ index d64a660..066f66d 100644
 +					path, spa_strerror(res));
 +			return res;
 +		}
-+		pa_log_warn("Could not connect to volume control service at %s: %s; retrying",
++		pa_log_warn("Could not reach external volume control at %s: %s; retrying",
 +				path, spa_strerror(res));
-+		schedule_reconnect(ext_volume);
++		ext_volume->unreachable = true;
++		schedule_reconnect(ext_volume, ext_volume->connect_msec);
++		ext_volume->connect_msec = backoff(ext_volume->connect_msec);
 +		return 0;
 +	}
 +
 +	if (wants_monitor(ext_volume) && (res = start_monitor(ext_volume)) < 0) {
 +		pa_log_error("Could not monitor external volume: %s", spa_strerror(res));
-+		schedule_reconnect(ext_volume);
++		schedule_reconnect(ext_volume, ext_volume->monitor_msec);
 +	}
 +
 +	return 0;
@@ -545,6 +590,8 @@ index d64a660..066f66d 100644
 +	free(ext_volume->device);
 +	ext_volume->device = NULL;
 +	ext_volume->flags = 0;
++	ext_volume->pending_msec = 0;
++	ext_volume->unreachable = false;
 +	ext_volume->changed = NULL;
 +	ext_volume->ready = NULL;
 +	ext_volume->data = NULL;
@@ -552,10 +599,10 @@ index d64a660..066f66d 100644
  
  int
 diff --git a/spa/plugins/alsa/acp/ext-volume.h b/spa/plugins/alsa/acp/ext-volume.h
-index ed026cd..2a6819c 100644
+index ed026cd..cf887ec 100644
 --- a/spa/plugins/alsa/acp/ext-volume.h
 +++ b/spa/plugins/alsa/acp/ext-volume.h
-@@ -8,21 +8,52 @@
+@@ -8,21 +8,55 @@
  #include <stdint.h>
  
  #include <spa/param/audio/volume.h>
@@ -589,7 +636,10 @@ index ed026cd..2a6819c 100644
 +	bool monitoring;
 +
 +	struct spa_source *reconnect_timer;
-+	uint32_t reconnect_msec;
++	uint32_t pending_msec;		/* Delay the timer is armed with, or 0 */
++	uint32_t connect_msec;		/* Next retry delay for the main connection */
++	uint32_t monitor_msec;		/* Next retry delay for Monitor */
++	bool unreachable;		/* Loss of the service has been reported */
 +
 +	spa_acp_ext_volume_changed_t changed;
 +	spa_acp_ext_volume_ready_t ready;
