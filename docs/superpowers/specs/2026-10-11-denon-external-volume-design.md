@@ -112,7 +112,7 @@ Serves `org.pipewire.ExternalVolume` for the configured `device` and `route`.
 
 | Method | Behaviour |
 |---|---|
-| `GetCapabilities` | Always succeeds for the configured device. Advertises `readVolume`, `writeVolumeAbsolute`, `readMute`, `writeMuteValue` and `writeMuteToggle`; `volumeRange {min: 0, max: 1, step: 0}` (ACP ignores it); `routes: [route]`. |
+| `GetCapabilities` | Always succeeds for the configured device. Advertises `readVolume`, `writeVolumeAbsolute`, `readMute`, `writeMuteValue` and `writeMuteToggle`; `volumeRange {min: 0, max: cap ÷ 100, step: 0.005}` (ACP ignores it); `routes: [route]`. |
 | `ReadVolume` / `ReadMute` | Answer from the cache. Before the first state is known, return `[0.0]` / `false`. |
 | `WriteVolumeAbsolute` | Reply immediately. If `active()`, queue `MV<to_mv(max(volume))>`; otherwise re-publish the state so it reaches Monitor subscribers. |
 | `WriteVolumeRelative` | Reply `OperationUnsupported` (not advertised). |
