@@ -1,15 +1,20 @@
 //! The Denon AVR telnet control protocol: `\r`-terminated ASCII lines on TCP port 23.
 
+use std::fmt;
+
 use crate::scale::Mv;
 
 pub const PORT: u16 = 23;
 
 /// Sent after connecting so the state is known without waiting for something to change.
-pub const QUERIES: [&str; 4] = ["ZM?\r", "SI?\r", "MV?\r", "MU?\r"];
+/// Ends every line in both directions.
+pub const TERMINATOR: char = '\r';
+
+pub const QUERIES: [&str; 4] = ["ZM?", "SI?", "MV?", "MU?"];
 
 /// Sent periodically: a TCP write is the only way to notice a receiver that dropped off the
 /// network without closing the connection.
-pub const HEARTBEAT: &str = "ZM?\r";
+pub const HEARTBEAT: &str = "ZM?";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -45,12 +50,12 @@ pub enum Command {
     Mute(bool),
 }
 
-impl Command {
-    pub fn wire(self) -> String {
+impl fmt::Display for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Command::Volume(mv) => format!("MV{mv}\r"),
-            Command::Mute(true) => "MUON\r".to_owned(),
-            Command::Mute(false) => "MUOFF\r".to_owned(),
+            Command::Volume(mv) => write!(f, "MV{mv}"),
+            Command::Mute(true) => f.write_str("MUON"),
+            Command::Mute(false) => f.write_str("MUOFF"),
         }
     }
 }
@@ -65,7 +70,7 @@ impl LineBuffer {
     pub fn push(&mut self, data: &[u8]) -> Vec<String> {
         self.pending.extend_from_slice(data);
         let mut lines = Vec::new();
-        while let Some(end) = self.pending.iter().position(|&b| b == b'\r') {
+        while let Some(end) = self.pending.iter().position(|&b| b == TERMINATOR as u8) {
             let line: Vec<u8> = self.pending.drain(..=end).collect();
             let text = String::from_utf8_lossy(&line[..end]).trim().to_owned();
             if !text.is_empty() {
@@ -104,10 +109,10 @@ mod tests {
 
     #[test]
     fn formats_commands() {
-        assert_eq!(Command::Volume(Mv::from_whole(62)).wire(), "MV62\r");
-        assert_eq!(Command::Volume(Mv::from_half_steps(121)).wire(), "MV605\r");
-        assert_eq!(Command::Mute(true).wire(), "MUON\r");
-        assert_eq!(Command::Mute(false).wire(), "MUOFF\r");
+        assert_eq!(Command::Volume(Mv::from_whole(62)).to_string(), "MV62");
+        assert_eq!(Command::Volume(Mv::from_half_steps(121)).to_string(), "MV605");
+        assert_eq!(Command::Mute(true).to_string(), "MUON");
+        assert_eq!(Command::Mute(false).to_string(), "MUOFF");
     }
 
     #[test]
