@@ -2,3 +2,4 @@
 
 pub mod protocol;
 pub mod scale;
+pub mod state;
