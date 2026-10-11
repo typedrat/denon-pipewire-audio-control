@@ -199,6 +199,26 @@ patched builds can be checked alone.
   receiver knob and watch `wpctl get-volume @DEFAULT_AUDIO_SINK@`; move the
   slider and watch the receiver's display.
 
+## Volume step size
+
+Under this mapping, every 1% of PipeWire volume is 1 dB on the receiver, so the
+step size of whatever changes the volume sets how coarse it feels:
+
+- **Waybar** (`wireplumber` module, scroll on the icon): the `scroll-step`
+  option, in percent, defaults to 1.0, which is 1 dB per tick. It is set in
+  nix-config at `modules/home-manager/desktop/hyprland/bar/waybar/default.nix`.
+- **Hyprland volume keys** (none are bound today): bind
+  `XF86AudioRaiseVolume` / `XF86AudioLowerVolume` to
+  `wpctl set-volume @DEFAULT_AUDIO_SINK@ 1%+` / `1%-`. The step in that command
+  is the dB step: `0.5%` gives the receiver's finest step. Use `bindel`-style
+  repeat so holding a key keeps going. The bindings live next to the media keys
+  in nix-config at `modules/home-manager/desktop/hyprland/default.nix`.
+- **pavucontrol / other mixers:** dragging is continuous. Keyboard steps inside
+  pavucontrol are fixed by the application.
+
+The daemon enforces the cap whatever the step, so a `wpctl … 5%+` can't go past
+it.
+
 ## Out of scope / future work
 
 - **Auto-wake and input switching:** when the PC starts playing to the HDMI

@@ -3012,7 +3012,9 @@ Follow nix-config's own conventions for where host modules and inputs live; read
 
 Record any failure with the journal excerpt. Don't paper over it.
 
-- [ ] **Step 5: Commit nix-config changes** in that repo, only if the user asks for it.
+- [ ] **Step 5: Tell the user how to tune the step size** if knob-like steps feel too coarse or too fine (spec, "Volume step size"). Each 1% is 1 dB: waybar's `wireplumber` `scroll-step` defaults to 1, and volume keys, if the user wants them, are `wpctl set-volume @DEFAULT_AUDIO_SINK@ 1%+`/`1%-` bindings in nix-config's Hyprland module. Only edit those if the user asks.
+
+- [ ] **Step 6: Commit nix-config changes** in that repo, only if the user asks for it.
 
 ## Future work (not in this plan)
 
