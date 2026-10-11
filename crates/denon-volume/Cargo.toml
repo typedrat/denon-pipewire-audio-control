@@ -1,0 +1,21 @@
+[package]
+name = "denon-volume"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Drives a Denon AVR's volume from PipeWire via org.pipewire.ExternalVolume"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+mdns-sd = "0.21"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zlink = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
