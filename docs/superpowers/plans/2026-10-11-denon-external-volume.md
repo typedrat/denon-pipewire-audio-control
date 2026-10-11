@@ -1066,7 +1066,7 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 use crate::discovery;
-use crate::protocol::{self, HEARTBEAT, LineBuffer, QUERIES, TERMINATOR};
+use crate::protocol::{self, Command, HEARTBEAT, LineBuffer, QUERIES, TERMINATOR};
 use crate::scale::Mv;
 use crate::state::Shared;
 
