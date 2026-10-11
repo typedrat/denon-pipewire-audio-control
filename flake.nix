@@ -30,7 +30,13 @@
 
       flake.lib =
         let
-          patchesIn = dir: map (name: dir + "/${name}") (builtins.attrNames (builtins.readDir dir));
+          patchesIn =
+            dir:
+            map (name: dir + "/${name}") (
+              builtins.filter (name: builtins.match ".*\\.patch" name != null) (
+                builtins.attrNames (builtins.readDir dir)
+              )
+            );
         in
         {
           pipewirePatches = patchesIn ./patches/pipewire;

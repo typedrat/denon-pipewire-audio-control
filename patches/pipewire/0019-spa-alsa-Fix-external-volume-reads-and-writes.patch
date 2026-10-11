@@ -1,17 +1,35 @@
-From 0a498a082d139b4b1eb234fe0cf7359b6a3adccf Mon Sep 17 00:00:00 2001
+From 0af8a6fb05af5e9bfe588fa904d5ffa04c158822 Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:35:14 -0700
-Subject: [PATCH] spa: alsa: Fix external volume reads and writes
+Subject: [PATCH 19/20] spa: alsa: Fix external volume reads and writes
 
-ReadVolume and ReadMute read their value from the wrong JSON iterator, the varlink client stopped parsing before "continues", absolute volume writes sent the previous volume, and a second write while one awaited its reply failed. Writes are now oneway, and the service connection is set up once per card.
+ReadVolume and ReadMute read their value from the wrong JSON iterator,
+the varlink client stopped parsing before "continues", absolute volume
+writes sent the previous volume, and a second write while one awaited
+its reply failed. Writes are now oneway, volumes reported by the
+service are clamped to the valid range, and the service connection is
+set up once per card.
 
-The varlink client also refuses calls once disconnected instead of writing to a closed fd, honours sync-call timeouts of a second or more, closes the socket when connect fails, and frees destroyed clients, which impl_clear otherwise loops on forever.
+The varlink client now delivers every complete message in a read
+instead of leaving later ones buffered until more data arrives, and
+compacts its buffer so long-lived connections don't overflow it.
+Reply callbacks may make new calls or destroy the client. Writes use
+MSG_NOSIGNAL and never leave half a message on the socket: a write
+that would block is dropped with -EAGAIN, and one cut short
+disconnects. A sync call that times out or fails disconnects, so a
+late reply can't be taken as the answer to the next call.
+
+The client also refuses calls once disconnected instead of writing to
+a closed fd, reads replies sent just before a hangup, honours
+sync-call timeouts of a second or more, closes the socket when connect
+fails, and frees destroyed clients, which impl_clear otherwise loops on
+forever.
 ---
- spa/plugins/alsa/acp/acp.c        |  17 ++-
- spa/plugins/alsa/acp/ext-volume.c | 190 +++++++++++++++---------------
+ spa/plugins/alsa/acp/acp.c        |  17 +-
+ spa/plugins/alsa/acp/ext-volume.c | 192 +++++++++++----------
  spa/plugins/alsa/acp/ext-volume.h |   2 +-
- spa/plugins/support/varlink.c     |  47 +++++---
- 4 files changed, 138 insertions(+), 118 deletions(-)
+ spa/plugins/support/varlink.c     | 268 ++++++++++++++++++++----------
+ 4 files changed, 286 insertions(+), 193 deletions(-)
 
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
 index a41c216..47943b4 100644
@@ -55,10 +73,10 @@ index a41c216..47943b4 100644
  				return;
  			}
 diff --git a/spa/plugins/alsa/acp/ext-volume.c b/spa/plugins/alsa/acp/ext-volume.c
-index 6f08e7b..f5324a9 100644
+index 6f08e7b..d64a660 100644
 --- a/spa/plugins/alsa/acp/ext-volume.c
 +++ b/spa/plugins/alsa/acp/ext-volume.c
-@@ -39,13 +39,82 @@ static struct spa_varlink_client_events client_events = {
+@@ -39,13 +39,84 @@ static struct spa_varlink_client_events client_events = {
  	.destroy = client_destroy,
  };
  
@@ -106,9 +124,7 @@ index 6f08e7b..f5324a9 100644
 +
 +	if (spa_json_begin_object(&it, params, len) <= 0)
 +		return -EINVAL;
- 
--	if (error != NULL)
--		pa_log_error("Error calling %s: %s", method, error);
++
 +	while ((l = spa_json_object_next(&it, key, sizeof(key), &val)) > 0) {
 +		if (!spa_streq(key, "volume") || !spa_json_is_array(val, l))
 +			continue;
@@ -118,8 +134,10 @@ index 6f08e7b..f5324a9 100644
 +			return -EINVAL;
 +
 +		cvol->channels = 0;
-+		while (cvol->channels < PA_CHANNELS_MAX && spa_json_get_float(&arr, &v) > 0)
-+			cvol->values[cvol->channels++] = lrint(v * PA_VOLUME_NORM);
++		while (cvol->channels < PA_CHANNELS_MAX && spa_json_get_float(&arr, &v) > 0) {
++			double d = SPA_CLAMPD(v, 0.0, (double)PA_VOLUME_MAX / PA_VOLUME_NORM);
++			cvol->values[cvol->channels++] = lrint(d * PA_VOLUME_NORM);
++		}
 +
 +		return cvol->channels > 0 ? 0 : -EINVAL;
 +	}
@@ -133,7 +151,9 @@ index 6f08e7b..f5324a9 100644
 +	char key[64];
 +	const char *val;
 +	int l;
-+
+ 
+-	if (error != NULL)
+-		pa_log_error("Error calling %s: %s", method, error);
 +	if (spa_json_begin_object(&it, params, len) <= 0)
 +		return -EINVAL;
 +
@@ -146,7 +166,7 @@ index 6f08e7b..f5324a9 100644
  }
  
  int
-@@ -150,11 +219,9 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
+@@ -150,11 +221,9 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
  		const char *device, const char *route, pa_cvolume *cvol)
  {
  	struct spa_json_builder params_json;
@@ -159,7 +179,7 @@ index 6f08e7b..f5324a9 100644
  	size_t len;
  	int res;
  
-@@ -167,60 +234,28 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
+@@ -167,60 +236,28 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
  
  	spa_json_builder_close(&params_json);
  
@@ -231,7 +251,7 @@ index 6f08e7b..f5324a9 100644
  {
  	struct spa_json_builder params_json;
  	spa_autofree char *params = NULL;
-@@ -252,7 +287,7 @@ spa_acp_ext_volume_write_volume_absolute(struct spa_acp_ext_volume *ext_volume,
+@@ -252,7 +289,7 @@ spa_acp_ext_volume_write_volume_absolute(struct spa_acp_ext_volume *ext_volume,
  	spa_json_builder_close(&params_json);
  
  	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_VOLUME_ABSOLUTE,
@@ -240,7 +260,7 @@ index 6f08e7b..f5324a9 100644
  
  	if (res < 0) {
  		pa_log_error("Failed to write volume: %s", spa_strerror(res));
-@@ -282,7 +317,7 @@ spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
+@@ -282,7 +319,7 @@ spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
  	spa_json_builder_close(&params_json);
  
  	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_VOLUME_RELATIVE,
@@ -249,7 +269,7 @@ index 6f08e7b..f5324a9 100644
  
  	if (res < 0) {
  		pa_log_error("Failed to write volume: %s", spa_strerror(res));
-@@ -297,11 +332,9 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
+@@ -297,11 +334,9 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
  		const char *device, const char *route, bool *mute)
  {
  	struct spa_json_builder params_json;
@@ -262,7 +282,7 @@ index 6f08e7b..f5324a9 100644
  	size_t len;
  	int res;
  
-@@ -314,47 +347,20 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
+@@ -314,47 +349,20 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
  
  	spa_json_builder_close(&params_json);
  
@@ -317,7 +337,7 @@ index 6f08e7b..f5324a9 100644
  }
  
  int
-@@ -377,7 +383,7 @@ spa_acp_ext_volume_write_mute_value(struct spa_acp_ext_volume *ext_volume,
+@@ -377,7 +385,7 @@ spa_acp_ext_volume_write_mute_value(struct spa_acp_ext_volume *ext_volume,
  	spa_json_builder_close(&params_json);
  
  	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_MUTE_VALUE,
@@ -326,7 +346,7 @@ index 6f08e7b..f5324a9 100644
  
  	if (res < 0) {
  		pa_log_error("Failed to write mute state: %s", spa_strerror(res));
-@@ -406,7 +412,7 @@ spa_acp_ext_volume_write_mute_toggle(struct spa_acp_ext_volume *ext_volume,
+@@ -406,7 +414,7 @@ spa_acp_ext_volume_write_mute_toggle(struct spa_acp_ext_volume *ext_volume,
  	spa_json_builder_close(&params_json);
  
  	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_MUTE_TOGGLE,
@@ -349,10 +369,15 @@ index 6879ad3..ed026cd 100644
  int spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
  		const char *device, const char *route, float step);
 diff --git a/spa/plugins/support/varlink.c b/spa/plugins/support/varlink.c
-index 99b5025..3b5e6fa 100644
+index 99b5025..4fa2352 100644
 --- a/spa/plugins/support/varlink.c
 +++ b/spa/plugins/support/varlink.c
-@@ -6,6 +6,7 @@
+@@ -2,10 +2,12 @@
+ /* SPDX-FileCopyrightText: Copyright © 2026 Arun Raghavan */
+ /* SPDX-License-Identifier: MIT */
+ 
++#include <errno.h>
+ #include <fcntl.h>
  #include <string.h>
  #include <sys/socket.h>
  #include <sys/un.h>
@@ -360,8 +385,69 @@ index 99b5025..3b5e6fa 100644
  
  #include <spa/support/log.h>
  #include <spa/support/loop.h>
-@@ -114,6 +115,11 @@ client_call(void *object, const char *method, const char *params,
- 	size_t len, pos = 0;
+@@ -55,6 +57,8 @@ struct client {
+ 
+ 	struct spa_hook_list listeners;
+ 
++	bool *destroyed;		/* Set while reply callbacks run */
++
+ 	size_t pos;
+ 	size_t avail;
+ 	char buf[BUFFER_SIZE];
+@@ -103,6 +107,47 @@ build_call(const char *method, const char *params, bool oneway, bool more,
+ 	return json;
+ }
+ 
++static void client_disconnect(struct client *this);
++
++/* Sends the whole message including its NUL terminator. A message cut short
++ * leaves the peer mid-message, so the connection is dropped if the rest can't
++ * be sent. */
++static int
++send_message(struct client *this, const char *buf, size_t len)
++{
++	struct impl *impl = this->impl;
++	size_t pos = 0;
++	ssize_t res;
++
++	while (pos < len) {
++		res = send(this->fd, &buf[pos], len - pos, MSG_NOSIGNAL);
++		if (res > 0) {
++			pos += res;
++			continue;
++		}
++		if (res < 0 && errno == EINTR)
++			continue;
++
++		res = res < 0 ? -errno : -EIO;
++		if (res == -EWOULDBLOCK)
++			res = -EAGAIN;
++
++		if (pos > 0) {
++			spa_log_error(impl->log, "Message only partly sent (%s), disconnecting",
++					spa_strerror(res));
++			client_disconnect(this);
++		} else if (res == -EAGAIN) {
++			spa_log_warn(impl->log, "Service is not keeping up, dropping message");
++		} else {
++			spa_log_error(impl->log, "Error writing message: %s",
++					spa_strerror(res));
++		}
++		return res;
++	}
++
++	return 0;
++}
++
+ static int
+ client_call(void *object, const char *method, const char *params,
+ 		bool oneway, bool more, spa_varlink_reply_func_t cb,
+@@ -111,9 +156,14 @@ client_call(void *object, const char *method, const char *params,
+ 	struct client *this = SPA_CONTAINER_OF(object, struct client, client);
+ 	struct impl *impl = this->impl;
+ 	char *buf;
+-	size_t len, pos = 0;
++	size_t len;
  	int res;
  
 +	if (this->source == NULL) {
@@ -372,17 +458,46 @@ index 99b5025..3b5e6fa 100644
  	if (this->reply_pending) {
  		res = -EINVAL;
  		goto done;
-@@ -161,6 +167,9 @@ client_call_sync(void *object, const char *method, const char *params,
- 	size_t len, pos = 0;
+@@ -123,19 +173,10 @@ client_call(void *object, const char *method, const char *params,
+ 
+ 	spa_log_trace(impl->log, "sending message: %s", buf);
+ 
+-	/* We write the whole string including the NULL terminator */
+-	do {
+-		res = spa_system_write(this->impl->system, this->fd, &buf[pos], len - pos + 1);
+-		pos += res;
+-	} while ((res > 0 && len >= pos) || res == -EAGAIN || res == -EWOULDBLOCK);
+-
++	res = send_message(this, buf, len + 1);
+ 	free(buf);
+-
+-	if (res < 0) {
+-		spa_log_error(impl->log, "Error writing message: %s",
+-				spa_strerror(res));
++	if (res < 0)
+ 		goto done;
+-	}
+ 
+ 	if (!oneway) {
+ 		this->reply_pending = true;
+@@ -158,11 +199,13 @@ client_call_sync(void *object, const char *method, const char *params,
+ 	struct client *this = SPA_CONTAINER_OF(object, struct client, client);
+ 	struct impl *impl = this->impl;
+ 	char *buf;
+-	size_t len, pos = 0;
++	size_t len;
  	int res = 0;
  
+-	if (this->reply_pending || this->more_pending ||
+-			(this->pos != 0 && this->avail != 0)) {
 +	if (this->source == NULL)
 +		return -ENOTCONN;
 +
- 	if (this->reply_pending || this->more_pending ||
- 			(this->pos != 0 && this->avail != 0)) {
++	if (this->reply_pending || this->more_pending || this->avail != 0) {
  		spa_log_error(impl->log, "Invalid state for sync call");
-@@ -175,7 +184,10 @@ client_call_sync(void *object, const char *method, const char *params,
+ 		res = -EINVAL;
+ 	}
+@@ -175,26 +218,21 @@ client_call_sync(void *object, const char *method, const char *params,
  
  	fcntl(this->fd, F_SETFL, fcntl(this->fd, F_GETFL) & ~O_NONBLOCK);
  	if (timeout >= 0) {
@@ -394,7 +509,83 @@ index 99b5025..3b5e6fa 100644
  		setsockopt(this->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
  	}
  
-@@ -266,6 +278,9 @@ static void do_destroy(struct client *client)
+         buf = build_call(method, params, false, false, &len);
+ 
+ 	spa_log_trace(impl->log, "sending message: %s", buf);
+-	/* We write the whole string including the NULL terminator */
+-	do {
+-		res = spa_system_write(this->impl->system, this->fd, &buf[pos], len - pos + 1);
+-		pos += res;
+-	} while (res > 0 && len >= pos);
+ 
++	res = send_message(this, buf, len + 1);
+ 	free(buf);
+-
+-	if (res < 0) {
+-		spa_log_error(impl->log, "Error writing message: %s",
+-				spa_strerror(res));
++	if (res < 0)
+ 		goto done;
+-	}
+ 
+ 	while (true) {
+ 		size_t eom;
+@@ -205,15 +243,29 @@ client_call_sync(void *object, const char *method, const char *params,
+ 			if (res == -EINTR)
+ 				continue;
+ 
++			if (res == 0)
++				res = -ECONNRESET;
+ 			spa_log_error(impl->log, "Error reading from socket: %s",
+ 					spa_strerror(res));
+ 
++			/* A reply that arrives after a timeout would be taken
++			 * as the answer to the next call. */
++			this->avail = 0;
++			client_disconnect(this);
+ 			goto done;
+ 		}
+ 
+ 		spa_log_debug(impl->log, "Got %d bytes (avail: %zu)", res, this->avail);
+ 		this->avail += res;
+ 
++		if (this->avail == BUFFER_SIZE && memchr(this->buf, '\0', BUFFER_SIZE) == NULL) {
++			spa_log_error(impl->log, "Message larger than available buffer");
++			res = -EMSGSIZE;
++			this->avail = 0;
++			client_disconnect(this);
++			goto done;
++		}
++
+ 		for (eom = 0; eom < this->avail; eom++) {
+ 			if (this->buf[eom] == '\0')
+ 				break;
+@@ -236,10 +288,12 @@ client_call_sync(void *object, const char *method, const char *params,
+ 	}
+ 
+ done:
+-	fcntl(this->fd, F_SETFL, fcntl(this->fd, F_GETFL) | O_NONBLOCK);
++	if (this->source != NULL) {
++		fcntl(this->fd, F_SETFL, fcntl(this->fd, F_GETFL) | O_NONBLOCK);
+ 
+-        spa_loop_utils_update_io(impl->loop_utils, this->source,
+-			this->source->mask | SPA_IO_IN);
++		spa_loop_utils_update_io(impl->loop_utils, this->source,
++				this->source->mask | SPA_IO_IN);
++	}
+ 
+ 	return res;
+ }
+@@ -260,12 +314,18 @@ client_disconnect(struct client *this)
+ 
+ static void do_destroy(struct client *client)
+ {
++	if (client->destroyed)
++		*client->destroyed = true;
++
+ 	client_disconnect(client);
+ 
+ 	spa_hook_list_call(&client->listeners, struct spa_varlink_client_events,
  			destroy, SPA_VERSION_VARLINK_CLIENT_EVENTS);
  
  	spa_hook_list_clean(&client->listeners);
@@ -404,13 +595,15 @@ index 99b5025..3b5e6fa 100644
  }
  
  static void
-@@ -282,35 +297,32 @@ process_message(struct client *this, const char *msg, size_t len)
+@@ -282,36 +342,36 @@ process_message(struct client *this, const char *msg, size_t len)
  	struct spa_json json;
  	char key[64];
  	const char *val, *error = NULL, *params = NULL;
 -	int res;
 +	int res, error_len = 0, params_len = 0;
  	bool continues = false;
++	spa_varlink_reply_func_t cb;
++	void *cb_userdata;
  
  	spa_log_trace(impl->log, "got message: %.*s", (int)len, msg);
  
@@ -445,14 +638,171 @@ index 99b5025..3b5e6fa 100644
  		}
  	}
  
- 	if (this->cb)
+-	if (this->cb)
 -		this->cb(this->cb_userdata, params,  error, len, continues);
-+		this->cb(this->cb_userdata, params, error,
-+				error ? error_len : params_len, continues);
++	cb = this->cb;
++	cb_userdata = this->cb_userdata;
  
++	/* Settle the call state first: the callback may make a new call, or
++	 * destroy the client. */
  	if (!this->more_pending || !continues) {
  		/* We didn't ask for more, but server might send */
-@@ -425,6 +437,7 @@ impl_connect(void *object, const char *path)
+ 		if (continues)
+@@ -323,84 +383,107 @@ process_message(struct client *this, const char *msg, size_t len)
+ 		this->cb_userdata = NULL;
+ 	}
+ 
++	if (cb)
++		cb(cb_userdata, params, error,
++				error ? error_len : params_len, continues);
++
+ 	return;
+ 
+ error:
+ 	spa_log_error(impl->log, "Could not parse: %.*s", (int)len, msg);
+ }
+ 
+-static void
+-client_on_reply(void *userdata, int fd, uint32_t mask)
++/* Returns false once the client is destroyed or disconnected. */
++static bool
++client_read(struct client *this, int fd)
+ {
+-	struct client *this = (struct client *)userdata;
+ 	struct impl *impl = this->impl;
++	bool destroyed = false;
++	char *eom;
++	size_t start;
+ 	int res;
+ 
+-	if (mask & SPA_IO_HUP) {
+-		spa_log_info(impl->log, "Got hangup event");
+-		client_disconnect(this);
+-		return;
+-	}
+-
+-	if (mask & SPA_IO_ERR) {
+-		spa_log_info(impl->log, "Got error event");
+-		client_disconnect(this);
+-		return;
+-	}
+-
+-	spa_log_debug(impl->log, "Ready to read");
+-
+-	/* SPA_IO_IN */
+-	while (this->pos <= this->avail) {
+-		size_t eom;
+-
++	while (true) {
+ 		res = spa_system_read(impl->system, fd, &this->buf[this->avail],
+ 				BUFFER_SIZE - this->avail);
+-		if (res <= 0) {
++		if (res < 0) {
+ 			if (res == -EINTR)
+ 				continue;
+ 
+-			if (res == 0 || res == -EAGAIN || res == -EWOULDBLOCK)
+-				return;
++			if (res == -EAGAIN || res == -EWOULDBLOCK)
++				return true;
+ 
+ 			spa_log_error(impl->log, "Error reading from socket: %s",
+ 					spa_strerror(res));
+ 			client_disconnect(this);
+-
+-			return;
++			return false;
++		}
++		if (res == 0) {
++			spa_log_info(impl->log, "Connection closed by peer");
++			client_disconnect(this);
++			return false;
+ 		}
+ 
+ 		spa_log_debug(impl->log, "Got %d bytes (avail: %zu)", res, this->avail);
+ 		this->avail += res;
+ 
+-		for (eom = this->pos; eom < this->avail; eom++) {
+-			if (this->buf[eom] == '\0')
+-				break;
+-		}
++		/* Deliver every complete message now: the next read may not
++		 * return anything until the peer sends again. */
++		while ((eom = memchr(&this->buf[this->pos], '\0',
++						this->avail - this->pos)) != NULL) {
++			start = this->pos;
++			this->pos = eom - this->buf + 1;
+ 
+-		if (eom == this->avail) {
+-			if (eom == BUFFER_SIZE) {
+-				spa_log_error(impl->log, "Message larger than available buffer");
+-				client_disconnect(this);
+-			}
++			spa_log_debug(impl->log, "Consuming %zu bytes", this->pos - start);
+ 
+-			spa_log_debug(impl->log, "Need more data");
+-			return;
++			this->destroyed = &destroyed;
++			process_message(this, &this->buf[start], this->pos - start - 1);
++			if (destroyed)
++				return false;
++			this->destroyed = NULL;
++
++			if (this->source == NULL)
++				return false;
+ 		}
+ 
+-		process_message(this, &this->buf[this->pos], eom - this->pos);
++		/* Move any partial message to the front of the buffer */
++		if (this->pos > 0) {
++			memmove(this->buf, &this->buf[this->pos], this->avail - this->pos);
++			this->avail -= this->pos;
++			this->pos = 0;
++		}
+ 
+-		spa_log_debug(impl->log, "Consumed %zu bytes", eom + 1 - this->pos);
++		if (this->avail == BUFFER_SIZE) {
++			spa_log_error(impl->log, "Message larger than available buffer");
++			client_disconnect(this);
++			return false;
++		}
++	}
++}
++
++static void
++client_on_reply(void *userdata, int fd, uint32_t mask)
++{
++	struct client *this = (struct client *)userdata;
++	struct impl *impl = this->impl;
+ 
+-		/* Consume message so far and NUL terminator */
+-		this->pos = eom + 1;
++	/* Read first, so replies sent just before a hangup are still seen */
++	if (mask & SPA_IO_IN) {
++		spa_log_debug(impl->log, "Ready to read");
++		if (!client_read(this, fd))
++			return;
++	}
+ 
+-		if (this->pos == this->avail) {
+-			/* All data has been consumed, reset */
+-			this->pos = this->avail = 0;
+-			break;
+-		}
++	if (mask & SPA_IO_HUP) {
++		spa_log_info(impl->log, "Got hangup event");
++		client_disconnect(this);
++		return;
++	}
+ 
++	if (mask & SPA_IO_ERR) {
++		spa_log_info(impl->log, "Got error event");
++		client_disconnect(this);
++		return;
+ 	}
+ }
+ 
+@@ -425,6 +508,7 @@ impl_connect(void *object, const char *path)
  	client = calloc(1, sizeof(struct client));
  	if (client == NULL)
  		return NULL;
@@ -460,7 +810,7 @@ index 99b5025..3b5e6fa 100644
  
  	socket_path = varlink_parse_path(path, &transport);
  	/* We only support UNIX sockets for now */
-@@ -480,6 +493,8 @@ impl_connect(void *object, const char *path)
+@@ -480,6 +564,8 @@ impl_connect(void *object, const char *path)
  	return &client->client;
  
  error:
