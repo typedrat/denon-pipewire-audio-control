@@ -8,7 +8,7 @@ self:
 }:
 let
   cfg = config.services.denon-volume;
-  socket = "denon-volume/org.pipewire.ExternalVolume";
+  socket = "/run/denon-volume/org.pipewire.ExternalVolume";
   patched = import ./patched.nix {
     inherit pkgs;
     inherit (self.lib) pipewirePatches wireplumberPatches;
@@ -23,15 +23,6 @@ in
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.denon-volume;
       defaultText = lib.literalExpression "denon-pipewire-audio-control.packages.\${system}.denon-volume";
       description = "The denon-volume daemon.";
-    };
-
-    uid = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      example = 1000;
-      description = ''
-        UID of the user whose session runs the daemon. WirePlumber's configuration is
-        system-wide, so the per-user socket path has to be spelled out.
-      '';
     };
 
     alsaDevice = lib.mkOption {
@@ -95,23 +86,29 @@ in
       "monitor.alsa.rules" = [
         {
           matches = [ { "device.name" = cfg.alsaDevice; } ];
-          actions.update-props."api.alsa.external-volume-control" =
-            "unix:/run/user/${toString cfg.uid}/${socket}";
+          actions.update-props."api.alsa.external-volume-control" = "unix:${socket}";
         }
       ];
     };
 
-    systemd.user.sockets.denon-volume = {
+    # One system-wide daemon rather than one per user: the receiver accepts a single telnet
+    # client at a time, so per-user daemons would fight over it.
+    systemd.sockets.denon-volume = {
       description = "Denon AVR volume control socket";
       wantedBy = [ "sockets.target" ];
-      socketConfig.ListenStream = "%t/${socket}";
+      socketConfig = {
+        ListenStream = socket;
+        # WirePlumber runs as whichever user is logged in. Any local user may set the volume,
+        # which grants nothing the receiver's unauthenticated LAN control port doesn't already.
+        SocketMode = "0666";
+      };
     };
 
-    systemd.user.services.denon-volume = {
+    systemd.services.denon-volume = {
       description = "Denon AVR volume control for PipeWire";
-      # Started at login, not only on first connection, so the receiver's state is already
+      # Started at boot, not only on first connection, so the receiver's state is already
       # known when WirePlumber first asks for it.
-      wantedBy = [ "default.target" ];
+      wantedBy = [ "multi-user.target" ];
       requires = [ "denon-volume.socket" ];
       after = [ "denon-volume.socket" ];
       environment.RUST_LOG = cfg.logLevel;
@@ -119,6 +116,33 @@ in
         Type = "exec";
         Restart = "on-failure";
         RestartSec = 5;
+        DynamicUser = true;
+        CapabilityBoundingSet = "";
+        NoNewPrivileges = true;
+        PrivateDevices = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ProtectClock = true;
+        ProtectControlGroups = true;
+        ProtectHostname = true;
+        ProtectKernelLogs = true;
+        ProtectKernelModules = true;
+        ProtectKernelTunables = true;
+        ProtectProc = "invisible";
+        LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        RestrictSUIDSGID = true;
+        SystemCallArchitectures = "native";
+        # Netlink is how mDNS discovery enumerates network interfaces.
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+          "AF_NETLINK"
+        ];
         ExecStart = utils.escapeSystemdExecArgs (
           [
             (lib.getExe' cfg.package "denon-volume")

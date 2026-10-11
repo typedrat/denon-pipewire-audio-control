@@ -97,7 +97,6 @@
                       services.pipewire.enable = true;
                       services.denon-volume = {
                         enable = true;
-                        uid = 1000;
                         alsaDevice = "alsa_card.pci-0000_01_00.1";
                         pcInput = "BD";
                       };
@@ -108,9 +107,9 @@
               let
                 inherit (inputs.nixpkgs) lib;
                 wp = eval.config.services.pipewire.wireplumber.extraConfig."90-denon-volume";
-                # The socket unit's %t is the user's runtime dir, /run/user/<uid>. WirePlumber is
-                # configured with that path spelled out, so the two must name the same socket.
-                expectedPath = "unix:/run/user/1000/denon-volume/org.pipewire.ExternalVolume";
+                # WirePlumber and the socket unit each spell out the socket path, so the two must
+                # name the same socket.
+                expectedPath = "unix:/run/denon-volume/org.pipewire.ExternalVolume";
                 rule = builtins.head wp."monitor.alsa.rules";
                 wpOk =
                   assert lib.assertMsg (
@@ -127,8 +126,8 @@
               assert wpOk;
               pkgs.runCommand "denon-volume-module-check"
                 {
-                  service = eval.config.systemd.user.units."denon-volume.service".text;
-                  socket = eval.config.systemd.user.units."denon-volume.socket".text;
+                  service = eval.config.systemd.units."denon-volume.service".text;
+                  socket = eval.config.systemd.units."denon-volume.socket".text;
                   passAsFile = [
                     "service"
                     "socket"
@@ -139,7 +138,9 @@
                   grep -F '"--pc-input" "BD"' "$servicePath"
                   grep -F '"--cap-mv" "70"' "$servicePath"
                   grep -F 'RUST_LOG=info' "$servicePath"
-                  grep -F 'ListenStream=%t/denon-volume/org.pipewire.ExternalVolume' "$socketPath"
+                  grep -F 'ListenStream=/run/denon-volume/org.pipewire.ExternalVolume' "$socketPath"
+                  grep -F 'SocketMode=0666' "$socketPath"
+                  grep -F 'DynamicUser=true' "$servicePath"
                   cp "$servicePath" $out
                 '';
           };

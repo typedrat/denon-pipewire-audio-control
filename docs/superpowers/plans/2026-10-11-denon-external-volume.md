@@ -3014,20 +3014,20 @@ services.denon-volume = {
 ```
 Follow nix-config's own conventions for where host modules and inputs live; read its layout first. Confirm the UID with `id -u`.
 
-- [ ] **Step 3: Rebuild** with the method nix-config uses (e.g. `nh os switch` or `nixos-rebuild switch --flake …`), then log out and back in, or run `systemctl --user daemon-reload && systemctl --user restart denon-volume.socket denon-volume.service wireplumber pipewire`.
+- [ ] **Step 3: Rebuild** with the method nix-config uses (e.g. `nh os switch` or `nixos-rebuild switch --flake …`), then restart the audio stack with `systemctl --user restart wireplumber pipewire` (or log out and back in). The daemon is a system service and starts on switch.
 
 - [ ] **Step 4: Verify end to end**
 
-1. `systemctl --user status denon-volume` → active; the journal shows `connected to receiver`.
+1. `systemctl status denon-volume` → active; `journalctl -u denon-volume -b` shows `connected to receiver`.
 2. `journalctl --user -u wireplumber -b | grep -i 'external volume'` → shows the connection; no `requires support.varlink` error.
 3. `wpctl get-volume @DEFAULT_AUDIO_SINK@` → equals the receiver's display ÷ 100 (MV62 → 0.62).
 4. **Ask the user** to turn the receiver knob → `watch -n0.5 wpctl get-volume @DEFAULT_AUDIO_SINK@` follows within about a second.
 5. **Ask the user** to drag the slider in pavucontrol → the receiver's display tracks it; releasing leaves the receiver at the slider's position. Dragging past 70% stops the receiver at MV70 and the slider settles back at 70%.
 6. Mute from pavucontrol → the receiver shows MUTE; unmuting on the remote → pavucontrol updates.
 7. **Ask the user** to switch the receiver to another input and move the slider → the receiver doesn't change and the slider snaps back. Switch back to BD.
-8. `systemctl --user restart denon-volume` → within about 2 s the knob → slider sync works again (reconnect timer).
+8. `sudo systemctl restart denon-volume` → within about 2 s the knob → slider sync works again (reconnect timer).
 9. `journalctl --user -u denon-volume -b | grep 'call for an unknown device'` → expect nothing. If present, the device name ACP sends differs from `alsaDevice`.
-10. Late connect: `systemctl --user stop denon-volume.socket denon-volume.service`, restart WirePlumber, then `systemctl --user start denon-volume.socket`. WirePlumber logs a reconnect, and knob → slider sync works.
+10. Late connect: `sudo systemctl stop denon-volume.socket denon-volume.service`, `systemctl --user restart wireplumber`, then `sudo systemctl start denon-volume.socket`. WirePlumber logs a reconnect, and knob → slider sync works.
 11. **Ask the user** to put the receiver in standby, then power it on → the slider picks up the receiver's level.
 12. At login (or after restarting WirePlumber) with the receiver on the PC input, the receiver keeps its own level (the 3 s startup grace) and the slider reads that level.
 13. **Ask the user** to turn the receiver fully down and record the `MV` it reports (`journalctl --user -u denon-volume` at debug level, or `wpctl get-volume`).

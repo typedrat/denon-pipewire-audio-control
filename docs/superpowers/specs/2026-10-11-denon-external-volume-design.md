@@ -191,8 +191,8 @@ is an accepted limitation.
 
 Registers the SIGINT, SIGTERM and SIGHUP handlers first; any of them causes a
 clean exit. Then it uses the systemd `LISTEN_FDS` listener (only if `LISTEN_PID`
-names this process), falling back to binding
-`$XDG_RUNTIME_DIR/denon-volume/org.pipewire.ExternalVolume`. A guard removes a
+names this process), falling back to binding `--socket` or, without it,
+`$XDG_RUNTIME_DIR/denon-volume/org.pipewire.ExternalVolume` (for manual runs). A guard removes a
 self-bound socket on every exit path. `bind` refuses to replace a socket a live
 server answers on, and replaces a stale one. Logging goes through `tracing`
 (`RUST_LOG`).
@@ -258,7 +258,6 @@ same connection, so `Monitor` runs on a second connection.
 |---|---|
 | `enable` | `false` |
 | `package` | the flake's daemon |
-| `uid` | — (required; e.g. `1000`) |
 | `alsaDevice` | — (e.g. `"alsa_card.pci-0000_01_00.1"`) |
 | `route` | `"hdmi-output-0"` |
 | `pcInput` | — (e.g. `"BD"`) |
@@ -267,8 +266,9 @@ same connection, so `Monitor` runs on a second connection.
 | `select` | `null` (`did` or friendly name) |
 | `logLevel` | `"info"` |
 
-`uid` names the user whose session runs the daemon. WirePlumber's configuration
-is system-wide, so the per-user socket path has to be spelled out.
+The daemon runs as one system service rather than one per user: the receiver
+accepts a single telnet client at a time, and a fixed socket path keeps the
+system-wide WirePlumber configuration independent of who is logged in.
 
 When enabled, the module:
 
@@ -278,10 +278,13 @@ When enabled, the module:
 - adds the WirePlumber config: `context.properties."support.varlink" = true`,
   `wireplumber.settings."monitor.alsa.enable-external-volume-control" = true`,
   and a `monitor.alsa.rules` entry for `alsaDevice` that sets
-  `api.alsa.external-volume-control = "unix:/run/user/<uid>/denon-volume/org.pipewire.ExternalVolume"`.
-- defines a systemd user socket (`ListenStream=%t/denon-volume/org.pipewire.ExternalVolume`)
-  and a service (`Type=exec`, `Restart=on-failure`, `RestartSec=5`, started at
-  login, with `ExecStart` built from the options using systemd escaping).
+  `api.alsa.external-volume-control = "unix:/run/denon-volume/org.pipewire.ExternalVolume"`.
+- defines a system socket (`ListenStream=/run/denon-volume/org.pipewire.ExternalVolume`,
+  `SocketMode=0666`, since WirePlumber runs as the logged-in user and the
+  receiver's own control port is unauthenticated anyway) and a service
+  (`Type=exec`, `Restart=on-failure`, `RestartSec=5`, started at boot,
+  `DynamicUser` with systemd sandboxing, `ExecStart` built from the options using
+  systemd escaping).
 
 The flake also exposes `packages.pipewire` and `packages.wireplumber` so the
 patched builds can be checked alone. Its `nixos-module` check evaluates the
