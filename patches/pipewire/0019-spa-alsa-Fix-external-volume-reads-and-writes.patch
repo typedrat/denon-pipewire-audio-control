@@ -1,4 +1,4 @@
-From 8c5a8e0c227c25bb1153e22b82d1bee069c6b5ec Mon Sep 17 00:00:00 2001
+From 6110d5ae893ecd919ce0301f367ab8e9e4f280cd Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:35:14 -0700
 Subject: [PATCH 19/20] spa: alsa: Fix external volume reads and writes
@@ -27,13 +27,17 @@ a closed fd, reads replies sent just before a hangup, honours
 sync-call timeouts of a second or more, closes the socket when connect
 fails, and frees destroyed clients, which impl_clear otherwise loops on
 forever.
+
+The external volume paths also wait for a port to be selected: the
+service is addressed by route, and devices are enabled, and their
+volume read, before any port is active.
 ---
  spa/include/spa/support/varlink.h |   3 +-
- spa/plugins/alsa/acp/acp.c        |  17 +-
+ spa/plugins/alsa/acp/acp.c        |  31 +++-
  spa/plugins/alsa/acp/ext-volume.c | 192 ++++++++++----------
  spa/plugins/alsa/acp/ext-volume.h |   2 +-
  spa/plugins/support/varlink.c     | 290 ++++++++++++++++++++----------
- 5 files changed, 303 insertions(+), 201 deletions(-)
+ 5 files changed, 317 insertions(+), 201 deletions(-)
 
 diff --git a/spa/include/spa/support/varlink.h b/spa/include/spa/support/varlink.h
 index 9031d3d..78c6c0a 100644
@@ -50,7 +54,7 @@ index 9031d3d..78c6c0a 100644
  };
  
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
-index a41c216..47943b4 100644
+index a41c216..d655bee 100644
 --- a/spa/plugins/alsa/acp/acp.c
 +++ b/spa/plugins/alsa/acp/acp.c
 @@ -1258,20 +1258,19 @@ static void init_ext_volume(pa_card *impl)
@@ -81,7 +85,26 @@ index a41c216..47943b4 100644
  }
  
  uint32_t acp_card_find_best_profile_index(struct acp_card *card, const char *name)
-@@ -1465,7 +1464,7 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+@@ -1390,6 +1389,11 @@ static int read_volume(pa_alsa_device *dev)
+ 		/* Externally managed volume */
+ 		pa_cvolume ext_vol;
+ 
++		/* The service is addressed by route, and devices are enabled
++		 * before a port is selected. */
++		if (!dev->active_port)
++			return 0;
++
+ 		if ((res = spa_acp_ext_volume_read_volume(&impl->card.ext_volume, impl->name,
+ 						dev->active_port->name, &ext_vol)) < 0) {
+ 			pa_log_error("Could not read volume: %s", snd_strerror(res));
+@@ -1461,11 +1465,14 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+ 	}
+ 
+ 	if (impl->card.ext_volume.client) {
++		if (!dev->active_port)
++			return;
++
+ 		if (impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_WRITE_VOLUME_VALUE) {
  			/* External volume control by value */
  			if (spa_acp_ext_volume_write_volume_absolute(&impl->card.ext_volume,
  						impl->name, dev->active_port->name,
@@ -90,6 +113,26 @@ index a41c216..47943b4 100644
  				pa_log_error("Could not write volume");
  				return;
  			}
+@@ -1573,6 +1580,9 @@ static int read_mute(pa_alsa_device *dev)
+ 	if (impl->card.ext_volume.client &&
+ 			(impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_READ_MUTE)) {
+ 		/* Externally managed mute state */
++		if (!dev->active_port)
++			return 0;
++
+ 		if (spa_acp_ext_volume_read_mute(&impl->card.ext_volume, impl->name,
+ 					dev->active_port->name, &mute) < 0) {
+ 			pa_log_error("Could not read mute state");
+@@ -1620,6 +1630,9 @@ static void set_mute(pa_alsa_device *dev, bool mute)
+ 	}
+ 
+ 	if (impl->card.ext_volume.client) {
++		if (!dev->active_port)
++			return;
++
+ 		if ((impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_WRITE_MUTE_VALUE)) {
+ 			/* Externally managed mute state by value*/
+ 			if (spa_acp_ext_volume_write_mute_value(&impl->card.ext_volume, impl->name,
 diff --git a/spa/plugins/alsa/acp/ext-volume.c b/spa/plugins/alsa/acp/ext-volume.c
 index 6f08e7b..d64a660 100644
 --- a/spa/plugins/alsa/acp/ext-volume.c

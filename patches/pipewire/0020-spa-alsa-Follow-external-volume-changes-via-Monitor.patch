@@ -1,4 +1,4 @@
-From 25c78d00f1a410ed6c6349a0fbf3aa8bcd0eef02 Mon Sep 17 00:00:00 2001
+From a4881db985807b8cee99b26e1c2b73d232deb08f Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:36:59 -0700
 Subject: [PATCH 20/20] spa: alsa: Follow external volume changes via Monitor
@@ -27,7 +27,7 @@ Monitor stream that ends is restarted.
  4 files changed, 452 insertions(+), 40 deletions(-)
 
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
-index 47943b4..f6325b1 100644
+index d655bee..e7f7990 100644
 --- a/spa/plugins/alsa/acp/acp.c
 +++ b/spa/plugins/alsa/acp/acp.c
 @@ -22,6 +22,7 @@ void *_acp_log_data;
@@ -169,7 +169,7 @@ index 47943b4..f6325b1 100644
  	if (res < 0)
  		spa_acp_ext_volume_destroy(&card->ext_volume);
  }
-@@ -1395,18 +1500,8 @@ static int read_volume(pa_alsa_device *dev)
+@@ -1400,18 +1505,8 @@ static int read_volume(pa_alsa_device *dev)
  			return 0;
  		}
  
@@ -190,7 +190,7 @@ index 47943b4..f6325b1 100644
  	} else if (dev->mixer_handle) {
  		/* ALSA mixer for volume */
  		if (dev->mixer_path->has_volume_mute && dev->muted) {
-@@ -1469,9 +1564,10 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+@@ -1477,9 +1572,10 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
  				return;
  			}
  
@@ -204,7 +204,7 @@ index 47943b4..f6325b1 100644
  		} else if ((impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_READ_VOLUME) &&
  				(impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_WRITE_VOLUME_UPDOWN)) {
  			/* External volume control by increment/decrement only */
-@@ -1577,6 +1673,9 @@ static int read_mute(pa_alsa_device *dev)
+@@ -1588,6 +1684,9 @@ static int read_mute(pa_alsa_device *dev)
  			pa_log_error("Could not read mute state");
  			return 0;
  		}
