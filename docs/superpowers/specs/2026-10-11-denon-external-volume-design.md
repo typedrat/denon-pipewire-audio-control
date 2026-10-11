@@ -39,7 +39,8 @@ Valve's `cec-audio-control` reference server.
    is applied. Writes round to the nearest 0.5 step and clamp to
    `[MV 0, cap]`, and `v ≤ 0` maps to MV 0. The default cap is
    **MV 70 (−10 dB)**: dragging past 70% leaves the receiver at MV70, and the
-   slider settles back to 70%. A level above the cap set on the receiver
+   slider is pulled back to 70% (by the receiver's echo, or by an explicit
+   re-publish when the receiver is already at MV70 and has nothing to echo). A level above the cap set on the receiver
    itself reads back as it is. Two side effects are accepted: pavucontrol's
    dB label (computed from its cubic curve) won't match the receiver, and a
    5% volume-key step is a 5 dB change.
@@ -110,6 +111,9 @@ Owns the one telnet connection.
 
 - **Connect:** resolve the target through `discovery` (or `host`), then connect
   to port 23. On connect, clear the outbox and send `ZM?`, `SI?`, `MV?`, `MU?`.
+- **Re-query on power-on:** the receiver may not answer `MV?` and `MU?` in
+  standby, so when a power-on report arrives and power wasn't already known to
+  be on, the four queries are sent again, spaced like the initial ones.
 - **Send:** an outbox that coalesces, so only the latest pending `MV` and the
   latest pending `MU` are kept, with at least 50 ms between commands. A pending
   mute goes before a pending volume. Commands queued while disconnected are
@@ -140,8 +144,19 @@ state and decides which PipeWire requests become receiver commands:
 
 - **Write gating:** a request while not `active()` is refused and the state is
   re-published, so subscribers drop the write and the slider snaps back.
+- **Startup grace:** for 3 s after each `GetCapabilities` returns, volume and
+  mute writes are refused exactly like writes while not `active()`. When the
+  route activates, WirePlumber restores its stored volume and mute and ACP
+  forwards them right after `GetCapabilities`; those are stale, and passing
+  them would force an old level, up to the cap, onto a receiver that is on the
+  PC input. The receiver's own level wins and the slider snaps back to it.
 - **Cap:** an over-cap request is clamped to the cap before rounding. NaN and
-  negative requests mean silence.
+  negative requests mean silence. If the receiver is already at the clamped
+  level it has no change to echo, so the state is re-published to pull the
+  slider back from the over-cap value.
+- **Disconnect:** `power` and `input` are cleared, so a reconnect can't gate
+  writes on the previous session's values before the queries are answered. The
+  last known level and mute are kept for readers.
 - **Echo suppression:** the requested fraction is remembered with the level it
   rounded to. While the receiver sits at that level the exact fraction is
   reported, so PipeWire sees its write echoed unchanged rather than nudged by
@@ -275,7 +290,9 @@ systemd socket.
   back to itself), 0.62 ↔ MV62, 0.613 → MV61.5, 0.9 → MV70 (the cap), 0 → MV0,
   MV80 reading as 0.80, and the wire formatting `605` / `00`.
 - **`protocol`, `state`, `discovery`:** unit tests for line reassembly and
-  parsing, write gating, echo suppression, notify-on-confirm, the cap, and
+  parsing, write gating, the startup grace, echo suppression,
+  notify-on-confirm, the cap and its snap-back, clearing power and input on
+  disconnect, and
   selector matching.
 - **`avr`:** tokio tests against an in-process fake Denon TCP server. They
   cover initial queries, queued commands, coalescing, and reconnect after the

@@ -213,3 +213,28 @@ async fn monitor_streams_receiver_changes() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn writes_right_after_get_capabilities_are_refused_and_snap_back() {
+    with_service(|h| async move {
+        h.receiver_on_pc();
+        let mut monitor_conn = unix::connect(&h.path).await.unwrap();
+        let mut conn = unix::connect(&h.path).await.unwrap();
+        let stream = monitor_conn.monitor(DEVICE).await.unwrap();
+        pin_mut!(stream);
+        let real = next_update(&mut stream).await;
+
+        conn.get_capabilities(DEVICE).await.unwrap().unwrap();
+        conn.write_volume_absolute(DEVICE, ROUTE, &[0.2])
+            .await
+            .unwrap()
+            .unwrap();
+        conn.write_mute_value(DEVICE, ROUTE, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.outbox.take(), None);
+        assert_eq!(next_update(&mut stream).await, real);
+    })
+    .await;
+}

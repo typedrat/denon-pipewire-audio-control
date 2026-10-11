@@ -48,6 +48,7 @@ pub struct Mute {
 pub struct MonitorUpdate {
     pub route: String,
     pub volume: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
 }
 

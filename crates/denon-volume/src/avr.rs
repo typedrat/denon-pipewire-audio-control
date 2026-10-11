@@ -134,10 +134,7 @@ async fn session(
     heartbeat_interval: Duration,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.split();
-    for query in QUERIES {
-        send(&mut writer, query).await?;
-        time::sleep(COMMAND_SPACING).await;
-    }
+    query_all(&mut writer).await?;
 
     let mut lines = LineBuffer::default();
     let mut buf = [0u8; 1024];
@@ -162,7 +159,14 @@ async fn session(
                 for line in lines.push(&buf[..n]) {
                     debug!(line, "from receiver");
                     if let Some(event) = protocol::parse_line(&line) {
+                        // A receiver in standby may ignore `MV?`/`MU?`, so ask again once
+                        // it wakes.
+                        let waking = matches!(event, protocol::Event::Power(true))
+                            && shared.snapshot().power != Some(true);
                         shared.apply(event);
+                        if waking {
+                            query_all(&mut writer).await?;
+                        }
                     }
                 }
             }
@@ -180,6 +184,14 @@ async fn session(
             }
         }
     }
+}
+
+async fn query_all(writer: &mut WriteHalf<'_>) -> io::Result<()> {
+    for query in QUERIES {
+        send(writer, query).await?;
+        time::sleep(COMMAND_SPACING).await;
+    }
+    Ok(())
 }
 
 async fn send(writer: &mut WriteHalf<'_>, line: impl fmt::Display) -> io::Result<()> {
@@ -291,6 +303,21 @@ mod tests {
             assert_eq!(s.input.as_deref(), Some("BD"));
             assert_eq!(s.mv, Some(Mv::from_whole(62)));
             assert_eq!(s.mute, Some(false));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn requeries_when_the_receiver_wakes() {
+        let (listener, port) = listen().await;
+        let (shared, outbox) = fixtures();
+        with_daemon(config(port), shared.clone(), outbox, async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_until(&mut sock, "MU?\r").await;
+            sock.write_all(b"ZMOFF\r").await.unwrap();
+            wait_for(&shared, |s| s.power == Some(false)).await;
+            sock.write_all(b"ZMON\r").await.unwrap();
+            read_until(&mut sock, "MV?\r").await;
         })
         .await;
     }

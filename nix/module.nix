@@ -79,6 +79,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.capMv * 2 == builtins.floor (cfg.capMv * 2);
+        message = "services.denon-volume.capMv must be a multiple of 0.5, but is ${toString cfg.capMv}.";
+      }
+    ];
+
     services.pipewire.package = lib.mkDefault patched.pipewire;
     services.pipewire.wireplumber.package = lib.mkDefault patched.wireplumber;
 
