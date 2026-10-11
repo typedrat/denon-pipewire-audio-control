@@ -8,3 +8,8 @@ series, taken unmodified from SteamOS source packages (`jupiter-main/pipewire-1:
 client's message handling, connection lifetime and sync-call timeouts. `pipewire/0020` makes ACP
 follow volume changes pushed by the service through `Monitor`, and reconnect when the service
 is absent at startup or goes away.
+
+Like PipeWire and WirePlumber themselves, everything under `patches/` is
+licensed under the MIT license; see each project's COPYING file. The rest of
+this repository is available under either the MIT license or the Apache
+License 2.0, at your option.

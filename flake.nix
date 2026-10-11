@@ -53,10 +53,10 @@
             inherit (inputs.self.lib) pipewirePatches wireplumberPatches;
           };
           craneLib = inputs.crane.mkLib pkgs;
-          commonArgs = {
+          # The workspace root has no [package], so the name and version come from the crate.
+          commonArgs = craneLib.crateNameFromCargoToml { cargoToml = ./crates/denon-volume/Cargo.toml; } // {
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
-            pname = "denon-volume";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           denon-volume = craneLib.buildPackage (

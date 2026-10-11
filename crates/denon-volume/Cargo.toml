@@ -2,7 +2,8 @@
 name = "denon-volume"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/typedrat/denon-pipewire-audio-control"
 description = "Drives a Denon AVR's volume from PipeWire via org.pipewire.ExternalVolume"
 
 [dependencies]
