@@ -43,8 +43,14 @@ impl ExternalVolume {
         }
     }
 
+    /// PipeWire's ALSA code doesn't name the card in its calls, so an empty name is the
+    /// configured device; which card uses this service is decided by WirePlumber's rules.
+    fn accepts(&self, device: &str) -> bool {
+        device.is_empty() || device == self.device
+    }
+
     fn check_device(&self, device: &str) -> Result<(), ExternalVolumeError> {
-        if device == self.device {
+        if self.accepts(device) {
             Ok(())
         } else {
             warn!(device, expected = %self.device, "call for an unknown device");
@@ -192,7 +198,7 @@ impl ExternalVolume {
         more: bool,
         device: String,
     ) -> impl Stream<Item = Reply<MonitorUpdate>> + use<> {
-        if device != self.device {
+        if !self.accepts(&device) {
             warn!(device, expected = %self.device, "monitor for an unknown device");
         }
         let route = self.route.clone();

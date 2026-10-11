@@ -122,6 +122,18 @@ async fn advertises_absolute_volume_and_mute() {
 }
 
 #[tokio::test]
+async fn accepts_the_unnamed_device_pipewire_sends() {
+    with_service(|h| async move {
+        h.receiver_on_pc();
+        let mut conn = unix::connect(&h.path).await.unwrap();
+        assert!(conn.get_capabilities("").await.unwrap().is_ok());
+        let volume = conn.read_volume("", ROUTE).await.unwrap().unwrap();
+        assert_eq!(volume.volume, [0.62]);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn reads_need_a_known_state() {
     with_service(|h| async move {
         let mut conn = unix::connect(&h.path).await.unwrap();
