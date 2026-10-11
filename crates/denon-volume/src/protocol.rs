@@ -6,10 +6,10 @@ use crate::scale::Mv;
 
 pub const PORT: u16 = 23;
 
-/// Sent after connecting so the state is known without waiting for something to change.
 /// Ends every line in both directions.
 pub const TERMINATOR: char = '\r';
 
+/// Sent after connecting so the state is known without waiting for something to change.
 pub const QUERIES: [&str; 4] = ["ZM?", "SI?", "MV?", "MU?"];
 
 /// Sent periodically: a TCP write is the only way to notice a receiver that dropped off the
