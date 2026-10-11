@@ -20,7 +20,6 @@ use crate::state::Shared;
 
 /// Denon's protocol documentation asks for at least 50 ms between commands.
 const COMMAND_SPACING: Duration = Duration::from_millis(50);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,6 +50,7 @@ impl Outbox {
 
     pub fn take(&self) -> Option<Command> {
         let mut pending = self.pending.lock().expect("outbox lock poisoned");
+        // A pending mute goes first: it is the change a listener notices soonest.
         if let Some(mute) = pending.mute.take() {
             return Some(Command::Mute(mute));
         }
@@ -85,6 +85,7 @@ pub struct ConnectConfig {
     pub port: u16,
     pub initial_backoff: Duration,
     pub max_backoff: Duration,
+    pub heartbeat_interval: Duration,
 }
 
 /// Keeps a session with the receiver open forever, reconnecting with exponential backoff.
@@ -97,7 +98,7 @@ pub async fn run(config: ConnectConfig, shared: Arc<Shared>, outbox: Arc<Outbox>
                 backoff = config.initial_backoff;
                 outbox.clear();
                 shared.set_connected(true);
-                if let Err(e) = session(stream, &shared, &outbox).await {
+                if let Err(e) = session(stream, &shared, &outbox, config.heartbeat_interval).await {
                     warn!("receiver session ended: {e:#}");
                 }
                 shared.set_connected(false);
@@ -126,7 +127,12 @@ async fn connect(config: &ConnectConfig) -> anyhow::Result<TcpStream> {
     Ok(stream)
 }
 
-async fn session(mut stream: TcpStream, shared: &Shared, outbox: &Outbox) -> anyhow::Result<()> {
+async fn session(
+    mut stream: TcpStream,
+    shared: &Shared,
+    outbox: &Outbox,
+    heartbeat_interval: Duration,
+) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.split();
     for query in QUERIES {
         send(&mut writer, query).await?;
@@ -135,14 +141,24 @@ async fn session(mut stream: TcpStream, shared: &Shared, outbox: &Outbox) -> any
 
     let mut lines = LineBuffer::default();
     let mut buf = [0u8; 1024];
-    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat = time::interval(heartbeat_interval);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // A tokio interval fires immediately; consume that so the first heartbeat is one full
+    // interval after the queries.
     heartbeat.tick().await;
+
+    // The receiver answers every heartbeat, so a connection that stays silent for two
+    // intervals has lost its peer. Without this, a peer that vanished without a FIN or RST
+    // leaves the read pending while writes keep succeeding into the kernel send buffer.
+    let idle_timeout = heartbeat_interval * 2;
+    let mut last_received = time::Instant::now();
 
     loop {
         tokio::select! {
             read = reader.read(&mut buf) => {
                 let n = read?;
                 anyhow::ensure!(n > 0, "receiver closed the connection");
+                last_received = time::Instant::now();
                 for line in lines.push(&buf[..n]) {
                     debug!(line, "from receiver");
                     if let Some(event) = protocol::parse_line(&line) {
@@ -157,6 +173,10 @@ async fn session(mut stream: TcpStream, shared: &Shared, outbox: &Outbox) -> any
             }
             _ = heartbeat.tick() => {
                 send(&mut writer, HEARTBEAT).await?;
+                time::sleep(COMMAND_SPACING).await;
+            }
+            () = time::sleep_until(last_received + idle_timeout) => {
+                anyhow::bail!("receiver stopped answering");
             }
         }
     }
@@ -197,6 +217,7 @@ mod tests {
             port,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(100),
         }
     }
 
@@ -301,6 +322,22 @@ mod tests {
                 .expect("no reconnect")
                 .unwrap();
             wait_for(&shared, |s| s.connected).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn drops_a_receiver_that_stops_answering() {
+        let (listener, port) = listen().await;
+        let (shared, outbox) = fixtures();
+        with_daemon(port, shared.clone(), outbox, async {
+            let (_sock, _) = listener.accept().await.unwrap();
+            wait_for(&shared, |s| s.connected).await;
+            wait_for(&shared, |s| !s.connected).await;
+            let (_sock, _) = time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("no reconnect")
+                .unwrap();
         })
         .await;
     }
