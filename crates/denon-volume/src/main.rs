@@ -30,7 +30,7 @@ struct Args {
     #[arg(long)]
     pc_input: String,
 
-    /// Receiver level that 100% maps to; MV 80 is 0 dB.
+    /// Highest receiver level (MV) the PC may set; MV 80 is 0 dB.
     #[arg(long, default_value = "70", value_parser = parse_cap)]
     cap_mv: Mv,
 

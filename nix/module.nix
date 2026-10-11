@@ -46,7 +46,7 @@ in
     capMv = lib.mkOption {
       type = lib.types.numbers.between 0 98;
       default = 70;
-      description = "Receiver level (MV) that 100% maps to, in steps of 0.5. MV 80 is 0 dB.";
+      description = "Highest receiver level (MV) the PC may set, in steps of 0.5. MV 80 is 0 dB.";
     };
 
     host = lib.mkOption {
