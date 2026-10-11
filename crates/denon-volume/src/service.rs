@@ -21,11 +21,6 @@ use crate::types::{
 /// 2 s. Waiting a little for the receiver to report in means that read gets a real answer.
 const FIRST_STATE_WAIT: Duration = Duration::from_millis(1500);
 
-/// When the HDMI route activates, WirePlumber restores its stored volume and mute and PipeWire
-/// forwards them as writes right after `GetCapabilities`. Those are stale, not a user's
-/// intent, so for this long the receiver's own level wins and PipeWire is snapped back to it.
-const STARTUP_GRACE: Duration = Duration::from_secs(3);
-
 pub struct ExternalVolume {
     device: String,
     route: String,
@@ -90,7 +85,7 @@ impl ExternalVolume {
         if tokio::time::timeout(FIRST_STATE_WAIT, known).await.is_err() {
             warn!("receiver state still unknown; PipeWire's first read will fail");
         }
-        self.shared.hold_writes_for(STARTUP_GRACE);
+        self.shared.hold_writes();
         Ok(Capabilities {
             read_volume: true,
             read_balance: false,

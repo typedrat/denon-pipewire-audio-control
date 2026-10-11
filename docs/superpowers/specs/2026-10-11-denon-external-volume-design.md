@@ -144,12 +144,16 @@ state and decides which PipeWire requests become receiver commands:
 
 - **Write gating:** a request while not `active()` is refused and the state is
   re-published, so subscribers drop the write and the slider snaps back.
-- **Startup grace:** for 3 s after each `GetCapabilities` returns, volume and
-  mute writes are refused exactly like writes while not `active()`. When the
+- **Startup grace:** for 3 s after each `GetCapabilities` returns, and after
+  any event that makes `active()` go from false to true (the receiver powering
+  on while on the PC input, or switching to it), volume and mute writes are refused exactly like writes while not `active()`. When the
   route activates, WirePlumber restores its stored volume and mute and ACP
   forwards them right after `GetCapabilities`; those are stale, and passing
   them would force an old level, up to the cap, onto a receiver that is on the
   PC input. The receiver's own level wins and the slider snaps back to it.
+  The second trigger covers the route re-activating without a new
+  `GetCapabilities`. A reconnect alone does not start the hold, but the power
+  and input answers that follow it do, since a disconnect clears both.
 - **Cap:** an over-cap request is clamped to the cap before rounding. NaN and
   negative requests mean silence. If the receiver is already at the clamped
   level it has no change to echo, so the state is re-published to pull the

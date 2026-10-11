@@ -65,6 +65,8 @@ impl Harness {
         self.shared.apply(Event::Input("BD".into()));
         self.shared.apply(Event::Volume(Mv::from_whole(62)));
         self.shared.apply(Event::Mute(false));
+        // Becoming active starts a hold, which would swallow the writes these tests send.
+        self.shared.hold_writes_for(Duration::ZERO);
     }
 }
 

@@ -37,6 +37,12 @@ impl AvrState {
     }
 }
 
+/// When the HDMI route activates, WirePlumber restores its stored volume and mute and PipeWire
+/// forwards them as writes. Those are stale, not a user's intent, so for this long after
+/// PipeWire attaches or the receiver starts listening to the PC, the receiver's own level wins
+/// and PipeWire is snapped back to it.
+const STARTUP_GRACE: Duration = Duration::from_secs(3);
+
 /// Holds the receiver state and decides which PipeWire requests become receiver commands.
 pub struct Shared {
     tx: watch::Sender<AvrState>,
@@ -54,6 +60,11 @@ impl Shared {
             cap,
             hold_until: Mutex::new(None),
         }
+    }
+
+    /// Starts the standard hold; see `hold_writes_for`.
+    pub fn hold_writes(&self) {
+        self.hold_writes_for(STARTUP_GRACE);
     }
 
     /// Refuses volume and mute writes for `d`, exactly as if the receiver were off the PC
@@ -95,16 +106,27 @@ impl Shared {
     }
 
     pub fn apply(&self, event: Event) {
-        self.tx.send_if_modified(|s| match event {
-            Event::Power(on) => s.power.replace(on) != Some(on),
-            Event::Input(input) => {
-                let changed = s.input.as_deref() != Some(input.as_str());
-                s.input = Some(input);
-                changed
-            }
-            Event::Volume(mv) => s.mv.replace(mv) != Some(mv),
-            Event::Mute(mute) => s.mute.replace(mute) != Some(mute),
+        let mut started_listening = false;
+        self.tx.send_if_modified(|s| {
+            let was_active = s.active(&self.pc_input);
+            let changed = match event {
+                Event::Power(on) => s.power.replace(on) != Some(on),
+                Event::Input(input) => {
+                    let changed = s.input.as_deref() != Some(input.as_str());
+                    s.input = Some(input);
+                    changed
+                }
+                Event::Volume(mv) => s.mv.replace(mv) != Some(mv),
+                Event::Mute(mute) => s.mute.replace(mute) != Some(mute),
+            };
+            started_listening = !was_active && s.active(&self.pc_input);
+            changed
         });
+        // Re-activating the HDMI route makes WirePlumber restore its stored volume and mute
+        // without a new `GetCapabilities`, so the receiver's own level must win here too.
+        if started_listening {
+            self.hold_writes();
+        }
     }
 
     /// Returns the level to send. `None` means the receiver isn't listening to the PC, and
@@ -157,6 +179,8 @@ mod tests {
         shared.apply(Event::Input("BD".into()));
         shared.apply(Event::Volume(Mv::from_whole(62)));
         shared.apply(Event::Mute(false));
+        // Reaching the active state starts a hold; tests of ordinary writes start without one.
+        *shared.hold_until.lock().unwrap() = None;
         shared
     }
 
@@ -247,6 +271,36 @@ mod tests {
         std::thread::sleep(Duration::from_millis(80));
         assert!(shared.request_volume(0.5).is_some());
         assert!(shared.request_mute());
+    }
+
+    #[test]
+    fn powering_on_while_on_the_pc_input_holds_writes() {
+        let shared = on_pc_input();
+        shared.apply(Event::Power(false));
+        shared.apply(Event::Power(true));
+        let mut rx = shared.subscribe();
+        rx.borrow_and_update();
+        assert_eq!(shared.request_volume(0.5), None);
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn switching_to_the_pc_input_holds_writes() {
+        let shared = on_pc_input();
+        shared.apply(Event::Input("GAME".into()));
+        shared.apply(Event::Input("BD".into()));
+        let mut rx = shared.subscribe();
+        rx.borrow_and_update();
+        assert_eq!(shared.request_volume(0.5), None);
+        assert!(rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn events_while_already_active_do_not_hold_writes() {
+        let shared = on_pc_input();
+        shared.apply(Event::Power(true));
+        shared.apply(Event::Volume(Mv::from_whole(50)));
+        assert!(shared.request_volume(0.5).is_some());
     }
 
     #[test]
