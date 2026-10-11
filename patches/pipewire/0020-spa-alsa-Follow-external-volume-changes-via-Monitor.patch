@@ -1,4 +1,4 @@
-From a4881db985807b8cee99b26e1c2b73d232deb08f Mon Sep 17 00:00:00 2001
+From 75616b9307c1be0edd0223fb23dbf4192b2222c8 Mon Sep 17 00:00:00 2001
 From: Alexis Williams <alexis@typedr.at>
 Date: Sun, 11 Oct 2026 14:36:59 -0700
 Subject: [PATCH 20/20] spa: alsa: Follow external volume changes via Monitor
@@ -19,12 +19,16 @@ fail meanwhile instead of falling through to the card's own mixer.
 Capabilities learned on a late connect install the devices' volume
 and mute hooks then and drop any software volume applied before. A
 Monitor stream that ends is restarted.
+
+Volume and mute changes also publish the device's updated routes
+right away. Mixer changes get that from the poll handler, but service
+updates arrive on their own socket, and mixers read the route.
 ---
  spa/plugins/alsa/acp/acp.c         | 135 ++++++++++--
  spa/plugins/alsa/acp/ext-volume.c  | 319 +++++++++++++++++++++++++++--
  spa/plugins/alsa/acp/ext-volume.h  |  36 +++-
- spa/plugins/alsa/alsa-acp-device.c |   2 +
- 4 files changed, 452 insertions(+), 40 deletions(-)
+ spa/plugins/alsa/alsa-acp-device.c |   9 +
+ 4 files changed, 459 insertions(+), 40 deletions(-)
 
 diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
 index d655bee..e7f7990 100644
@@ -660,7 +664,7 @@ index ed026cd..cf887ec 100644
  void spa_acp_ext_volume_destroy(struct spa_acp_ext_volume *ext_volume);
  
 diff --git a/spa/plugins/alsa/alsa-acp-device.c b/spa/plugins/alsa/alsa-acp-device.c
-index dbbd799..03f8c39 100644
+index dbbd799..2948f2d 100644
 --- a/spa/plugins/alsa/alsa-acp-device.c
 +++ b/spa/plugins/alsa/alsa-acp-device.c
 @@ -38,6 +38,7 @@
@@ -671,7 +675,28 @@ index dbbd799..03f8c39 100644
  
  #define MAX_POLL	16
  #define MAX_CHANNELS	SPA_AUDIO_MAX_CHANNELS
-@@ -1256,6 +1257,7 @@ impl_init(const struct spa_handle_factory *factory,
+@@ -1142,6 +1143,11 @@ static void on_volume_changed(void *data, struct acp_device *dev)
+ 	event = spa_pod_builder_pop(&b, &f[0]);
+ 
+ 	spa_device_emit_event(&this->hooks, event);
++
++	/* Mixer-driven changes are published by the poll handler, but an
++	 * external volume service reports changes from its own socket, so
++	 * publish the updated route here. */
++	emit_info(this, false);
+ }
+ 
+ static void on_mute_changed(void *data, struct acp_device *dev)
+@@ -1173,6 +1179,8 @@ static void on_mute_changed(void *data, struct acp_device *dev)
+ 	event = spa_pod_builder_pop(&b, &f[0]);
+ 
+ 	spa_device_emit_event(&this->hooks, event);
++
++	emit_info(this, false);
+ }
+ 
+ static const struct acp_card_events card_events = {
+@@ -1256,6 +1264,7 @@ impl_init(const struct spa_handle_factory *factory,
  	this->loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop);
  	acp_i18n = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_I18N);
  	acp_varlink = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Varlink);
