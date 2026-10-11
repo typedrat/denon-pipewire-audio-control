@@ -4,4 +4,6 @@ pub mod avr;
 pub mod discovery;
 pub mod protocol;
 pub mod scale;
+pub mod service;
 pub mod state;
+pub mod types;
