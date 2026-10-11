@@ -619,7 +619,7 @@ git commit -m "Add Denon telnet protocol parsing"
     - `new(pc_input: impl Into<String>, cap: Mv) -> Shared`
     - `cap(&self) -> Mv`, `subscribe(&self) -> watch::Receiver<AvrState>`, `snapshot(&self) -> AvrState`
     - `set_connected(&self, bool)`, `apply(&self, Event)`
-    - `request_volume(&self, f64) -> Option<Mv>`, `request_mute(&self, bool) -> bool`
+    - `request_volume(&self, f64) -> Option<Mv>`, `request_mute(&self) -> bool`
 
 - [ ] **Step 1: Write the failing tests** in `state.rs`
 
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(shared.request_volume(0.5), None);
         assert!(rx.has_changed().unwrap());
         rx.borrow_and_update();
-        assert!(!shared.request_mute(true));
+        assert!(!shared.request_mute());
         assert!(rx.has_changed().unwrap());
     }
 
@@ -834,8 +834,8 @@ impl Shared {
         target
     }
 
-    /// Returns whether to send the mute change, with the same snap-back as `request_volume`.
-    pub fn request_mute(&self, _mute: bool) -> bool {
+    /// Returns whether to send a mute change, with the same snap-back as `request_volume`.
+    pub fn request_mute(&self) -> bool {
         let mut active = false;
         self.tx.send_if_modified(|s| {
             active = s.active(&self.pc_input);
@@ -1716,7 +1716,7 @@ impl ExternalVolume {
     }
 
     fn write_mute(&self, mute: bool) {
-        if self.shared.request_mute(mute) {
+        if self.shared.request_mute() {
             self.outbox.push(Command::Mute(mute));
         } else {
             debug!(mute, "receiver isn't on the PC input; ignoring mute write");
