@@ -1,0 +1,445 @@
+From 4f7eacb463591b437956bade71e0f593ae02a361 Mon Sep 17 00:00:00 2001
+From: Alexis Williams <alexis@typedr.at>
+Date: Sun, 11 Oct 2026 14:36:59 -0700
+Subject: [PATCH] spa: alsa: Follow external volume changes via Monitor
+
+ACP opens a second connection for the streaming Monitor call and applies the pushed volume and mute to the active route, so changes made on the device itself show up in PipeWire. Both connections are re-established on a timer if the service goes away.
+---
+ spa/plugins/alsa/acp/acp.c         | 101 ++++++++++++++----
+ spa/plugins/alsa/acp/ext-volume.c  | 158 ++++++++++++++++++++++++++++-
+ spa/plugins/alsa/acp/ext-volume.h  |  21 ++++
+ spa/plugins/alsa/alsa-acp-device.c |   2 +
+ 4 files changed, 260 insertions(+), 22 deletions(-)
+
+diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
+index 47943b4..92032e7 100644
+--- a/spa/plugins/alsa/acp/acp.c
++++ b/spa/plugins/alsa/acp/acp.c
+@@ -22,6 +22,7 @@ void *_acp_log_data;
+ 
+ struct spa_i18n *acp_i18n;
+ struct spa_varlink *acp_varlink;
++struct spa_loop_utils *acp_loop_utils;
+ 
+ #define DEFAULT_CHANNELS	255u
+ #define DEFAULT_RATE		48000u
+@@ -1250,6 +1251,69 @@ static void init_eld_ctls(pa_card *impl)
+ 	}
+ }
+ 
++/* Applies a volume reported by the external service, expanding a single value
++ * to every channel. */
++static void update_ext_volume(pa_alsa_device *dev, const pa_cvolume *ext_vol)
++{
++	pa_card *impl = dev->card;
++	pa_cvolume r;
++	uint32_t i;
++
++	if (ext_vol->channels == 1) {
++		r.channels = dev->device.format.channels;
++		for (i = 0; i < r.channels; i++)
++			r.values[i] = ext_vol->values[0];
++	} else if (ext_vol->channels == dev->device.format.channels) {
++		r = *ext_vol;
++	} else {
++		pa_log_error("Mismatch channel count: device %u != volume %u",
++				dev->device.format.channels, ext_vol->channels);
++		return;
++	}
++
++	if (pa_cvolume_equal(&dev->hardware_volume, &r))
++		return;
++
++	dev->real_volume = dev->hardware_volume = r;
++	pa_cvolume_reset(&dev->soft_volume, r.channels);
++	pa_log_info("New external volume: %d", pa_cvolume_max(&r));
++
++	if (impl->events && impl->events->volume_changed)
++		impl->events->volume_changed(impl->user_data, &dev->device);
++}
++
++static void update_ext_mute(pa_alsa_device *dev, bool mute)
++{
++	pa_card *impl = dev->card;
++
++	if (mute == dev->muted)
++		return;
++
++	dev->muted = mute;
++	pa_log_info("New external mute: %d", mute);
++
++	if (impl->events && impl->events->mute_changed)
++		impl->events->mute_changed(impl->user_data, &dev->device);
++}
++
++static void ext_volume_changed(void *data, const char *route,
++		const pa_cvolume *volume, const bool *mute)
++{
++	pa_card *impl = data;
++	pa_alsa_device *dev;
++	uint32_t idx;
++
++	PA_DYNARRAY_FOREACH(dev, &impl->out.devices, idx) {
++		if (!(dev->device.flags & ACP_DEVICE_ACTIVE) ||
++				!dev->active_port || !spa_streq(dev->active_port->name, route))
++			continue;
++		if (volume)
++			update_ext_volume(dev, volume);
++		if (mute)
++			update_ext_mute(dev, *mute);
++	}
++}
++
+ static void init_ext_volume(pa_card *impl)
+ {
+ 	struct acp_card *card = &impl->card;
+@@ -1259,8 +1323,8 @@ static void init_ext_volume(pa_card *impl)
+ 		return;
+ 
+ 	/* Called for every enabled device, but the service connection is
+-	 * per card. */
+-	if (card->ext_volume.client)
++	 * per card. A set path with no client means a reconnect is pending. */
++	if (card->ext_volume.client || card->ext_volume.path)
+ 		return;
+ 
+ 	if (!acp_varlink) {
+@@ -1269,8 +1333,15 @@ static void init_ext_volume(pa_card *impl)
+ 	}
+ 
+ 	res = spa_acp_ext_volume_init(&card->ext_volume, acp_varlink, impl->ext_volume_path, impl->name, NULL);
+-	if (res < 0)
++	if (res < 0) {
+ 		spa_acp_ext_volume_destroy(&card->ext_volume);
++		return;
++	}
++
++	if (card->ext_volume.flags & (SPA_AUDIO_VOLUME_CONTROL_READ_VOLUME |
++				SPA_AUDIO_VOLUME_CONTROL_READ_MUTE))
++		spa_acp_ext_volume_monitor(&card->ext_volume, acp_loop_utils,
++				ext_volume_changed, impl);
+ }
+ 
+ uint32_t acp_card_find_best_profile_index(struct acp_card *card, const char *name)
+@@ -1395,18 +1466,8 @@ static int read_volume(pa_alsa_device *dev)
+ 			return 0;
+ 		}
+ 
+-		/* FIXME: scale to the range from capabilities */
+-		if (ext_vol.channels == 1) {
+-			r.channels = dev->device.format.channels;
+-			for (unsigned int i = 0; i < r.channels; i++)
+-				r.values[i] = ext_vol.values[0];
+-		} else if (ext_vol.channels == dev->device.format.channels) {
+-			r = ext_vol;
+-		} else {
+-			pa_log_error("Mismatch channel count: device %u != volume %u",
+-					dev->device.format.channels, ext_vol.channels);
+-			return 0;
+-		}
++		update_ext_volume(dev, &ext_vol);
++		return 0;
+ 	} else if (dev->mixer_handle) {
+ 		/* ALSA mixer for volume */
+ 		if (dev->mixer_path->has_volume_mute && dev->muted) {
+@@ -1469,9 +1530,10 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+ 				return;
+ 			}
+ 
+-			/* Update volume if we were successful */
+-			if (v != &dev->real_volume)
+-				dev->real_volume = *v;
++			/* The service reports this level back through Monitor once
++			 * the receiver applies it; recording it as the hardware
++			 * volume makes that echo a no-op. */
++			dev->real_volume = dev->hardware_volume = *v;
+ 		} else if ((impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_READ_VOLUME) &&
+ 				(impl->card.ext_volume.flags & SPA_AUDIO_VOLUME_CONTROL_WRITE_VOLUME_UPDOWN)) {
+ 			/* External volume control by increment/decrement only */
+@@ -1577,6 +1639,9 @@ static int read_mute(pa_alsa_device *dev)
+ 			pa_log_error("Could not read mute state");
+ 			return 0;
+ 		}
++
++		update_ext_mute(dev, mute);
++		return 0;
+ 	} else if (dev->mixer_handle) {
+ 		/* ALSA mixer for mute state */
+ 		if (dev->mixer_path->has_volume_mute) {
+diff --git a/spa/plugins/alsa/acp/ext-volume.c b/spa/plugins/alsa/acp/ext-volume.c
+index f5324a9..eeaab67 100644
+--- a/spa/plugins/alsa/acp/ext-volume.c
++++ b/spa/plugins/alsa/acp/ext-volume.c
+@@ -2,6 +2,10 @@
+ /* SPDX-FileCopyrightText: Copyright © 2026 Arun Raghavan */
+ /* SPDX-License-Identifier: MIT */
+ 
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
+ #include <spa/support/varlink.h>
+ #include <spa/utils/cleanup.h>
+ #include <spa/utils/json.h>
+@@ -21,12 +25,31 @@
+ #define METHOD_READ_MUTE VOLUME_CONTROL_BASE "ReadMute"
+ #define METHOD_WRITE_MUTE_VALUE VOLUME_CONTROL_BASE "WriteMuteValue"
+ #define METHOD_WRITE_MUTE_TOGGLE VOLUME_CONTROL_BASE "WriteMuteToggle"
++#define METHOD_MONITOR VOLUME_CONTROL_BASE "Monitor"
+ 
+ #define DEFAULT_TIMEOUT_MSEC 500
++#define RECONNECT_MSEC 1000
++
++static void schedule_reconnect(struct spa_acp_ext_volume *ext_volume)
++{
++	struct timespec value = {
++		.tv_sec = RECONNECT_MSEC / 1000,
++		.tv_nsec = (RECONNECT_MSEC % 1000) * SPA_NSEC_PER_MSEC,
++	};
++
++	if (ext_volume->loop_utils && ext_volume->reconnect_timer)
++		spa_loop_utils_update_timer(ext_volume->loop_utils,
++				ext_volume->reconnect_timer, &value, NULL, false);
++}
+ 
+ static void client_disconnect(void *userdata)
+ {
+-	/* TODO: reconnect? bail? */
++	struct spa_acp_ext_volume *ext_volume = userdata;
++
++	pa_log_warn("Lost connection to external volume control at %s", ext_volume->path);
++	/* The client can't be torn down from inside its own callback, so the
++	 * reconnect happens on a timer. */
++	schedule_reconnect(ext_volume);
+ }
+ 
+ static void client_destroy(void *userdata)
+@@ -117,6 +140,98 @@ static int parse_mute(const char *params, int len, bool *mute)
+ 	return -ENOENT;
+ }
+ 
++static void monitor_reply(void *data, const char *params, const char *error,
++		size_t len, bool continues)
++{
++	struct spa_acp_ext_volume *ext_volume = data;
++	struct spa_json it;
++	char key[64], route[256] = "";
++	const char *val;
++	pa_cvolume volume;
++	bool mute;
++	int l;
++
++	if (error) {
++		pa_log_error("External volume monitor failed: %.*s", (int)len, error);
++		schedule_reconnect(ext_volume);
++		return;
++	}
++	if (!params || !ext_volume->changed)
++		return;
++
++	if (spa_json_begin_object(&it, params, len) > 0) {
++		while ((l = spa_json_object_next(&it, key, sizeof(key), &val)) > 0) {
++			if (spa_streq(key, "route"))
++				spa_json_parse_stringn(val, l, route, sizeof(route));
++		}
++	}
++
++	ext_volume->changed(ext_volume->changed_data, route,
++			parse_volume(params, len, &volume) == 0 ? &volume : NULL,
++			parse_mute(params, len, &mute) == 0 ? &mute : NULL);
++}
++
++static void close_clients(struct spa_acp_ext_volume *ext_volume)
++{
++	if (ext_volume->monitor_client) {
++		spa_hook_remove(&ext_volume->monitor_listener);
++		spa_varlink_client_destroy(ext_volume->monitor_client);
++		ext_volume->monitor_client = NULL;
++	}
++	if (ext_volume->client) {
++		spa_hook_remove(&ext_volume->listener);
++		spa_varlink_client_destroy(ext_volume->client);
++		ext_volume->client = NULL;
++	}
++}
++
++/* Monitor gets its own connection: a pending "more" call blocks the sync
++ * reads ACP makes on the main one. */
++static int start_monitor(struct spa_acp_ext_volume *ext_volume)
++{
++	struct spa_json_builder params_json;
++	spa_autofree char *params = NULL;
++	size_t len;
++
++	ext_volume->monitor_client = spa_varlink_connect(ext_volume->varlink, ext_volume->path);
++	if (!ext_volume->monitor_client)
++		return -ECONNREFUSED;
++
++	spa_varlink_client_add_listener(ext_volume->monitor_client,
++			&ext_volume->monitor_listener, &client_events, ext_volume);
++
++	spa_json_builder_memstream(&params_json, &params, &len, 0);
++	spa_json_builder_object_push(&params_json, NULL, "{");
++	spa_json_builder_object_string(&params_json, "device", ext_volume->device);
++	spa_json_builder_pop(&params_json, "}");
++	spa_json_builder_close(&params_json);
++
++	return spa_varlink_client_call(ext_volume->monitor_client, METHOD_MONITOR, params,
++			false, true, monitor_reply, ext_volume);
++}
++
++static void on_reconnect_timer(void *data, uint64_t expirations)
++{
++	struct spa_acp_ext_volume *ext_volume = data;
++
++	close_clients(ext_volume);
++
++	ext_volume->client = spa_varlink_connect(ext_volume->varlink, ext_volume->path);
++	if (!ext_volume->client) {
++		schedule_reconnect(ext_volume);
++		return;
++	}
++	spa_varlink_client_add_listener(ext_volume->client, &ext_volume->listener,
++			&client_events, ext_volume);
++
++	if (start_monitor(ext_volume) < 0) {
++		schedule_reconnect(ext_volume);
++		return;
++	}
++
++	pa_log_info("Reconnected to external volume control at %s", ext_volume->path);
++}
++
+ int
+ spa_acp_ext_volume_init(struct spa_acp_ext_volume *ext_volume, struct spa_varlink *varlink,
+ 		const char *path, const char *device, const char *route)
+@@ -132,6 +247,10 @@ spa_acp_ext_volume_init(struct spa_acp_ext_volume *ext_volume, struct spa_varlin
+ 
+ 	pa_log_info("Connecting to external volume control at '%s'", path);
+ 
++	ext_volume->varlink = varlink;
++	ext_volume->path = strdup(path);
++	ext_volume->device = strdup(device ? device : "");
++
+ 	ext_volume->client = spa_varlink_connect(varlink, path);
+ 
+ 	if (!ext_volume->client) {
+@@ -208,10 +327,16 @@ done:
+ void
+ spa_acp_ext_volume_destroy(struct spa_acp_ext_volume *ext_volume)
+ {
+-	if (ext_volume->client) {
+-		spa_varlink_client_destroy(ext_volume->client);
+-		ext_volume->client = NULL;
++	if (ext_volume->reconnect_timer) {
++		spa_loop_utils_destroy_source(ext_volume->loop_utils, ext_volume->reconnect_timer);
++		ext_volume->reconnect_timer = NULL;
+ 	}
++	close_clients(ext_volume);
++	free(ext_volume->path);
++	ext_volume->path = NULL;
++	free(ext_volume->device);
++	ext_volume->device = NULL;
++	ext_volume->flags = 0;
+ }
+ 
+ int
+@@ -421,3 +546,28 @@ spa_acp_ext_volume_write_mute_toggle(struct spa_acp_ext_volume *ext_volume,
+ 
+ 	return 0;
+ }
++
++int
++spa_acp_ext_volume_monitor(struct spa_acp_ext_volume *ext_volume,
++		struct spa_loop_utils *loop_utils, spa_acp_ext_volume_changed_t changed,
++		void *data)
++{
++	int res;
++
++	ext_volume->changed = changed;
++	ext_volume->changed_data = data;
++	ext_volume->loop_utils = loop_utils;
++
++	if (loop_utils)
++		ext_volume->reconnect_timer = spa_loop_utils_add_timer(loop_utils,
++				on_reconnect_timer, ext_volume);
++	else
++		pa_log_warn("No loop utils; external volume control won't reconnect");
++
++	if ((res = start_monitor(ext_volume)) < 0) {
++		pa_log_error("Could not monitor external volume: %s", spa_strerror(res));
++		schedule_reconnect(ext_volume);
++	}
++
++	return res;
++}
+diff --git a/spa/plugins/alsa/acp/ext-volume.h b/spa/plugins/alsa/acp/ext-volume.h
+index ed026cd..fcac153 100644
+--- a/spa/plugins/alsa/acp/ext-volume.h
++++ b/spa/plugins/alsa/acp/ext-volume.h
+@@ -8,16 +8,31 @@
+ #include <stdint.h>
+ 
+ #include <spa/param/audio/volume.h>
++#include <spa/support/loop.h>
+ #include <spa/support/varlink.h>
+ 
+ typedef struct pa_cvolume pa_cvolume;
+ 
+ struct acp_card;
+ 
++typedef void (*spa_acp_ext_volume_changed_t)(void *data, const char *route,
++		const pa_cvolume *volume, const bool *mute);
++
+ struct spa_acp_ext_volume {
++	struct spa_varlink *varlink;
++	struct spa_loop_utils *loop_utils;
++	char *path;
++	char *device;
++
+ 	struct spa_varlink_client *client;
+ 	struct spa_hook listener;
+ 
++	struct spa_varlink_client *monitor_client;
++	struct spa_hook monitor_listener;
++	struct spa_source *reconnect_timer;
++	spa_acp_ext_volume_changed_t changed;
++	void *changed_data;
++
+ 	enum spa_audio_volume_control_flags flags;
+ };
+ 
+@@ -44,4 +59,10 @@ int spa_acp_ext_volume_write_mute_value(struct spa_acp_ext_volume *ext_volume,
+ int spa_acp_ext_volume_write_mute_toggle(struct spa_acp_ext_volume *ext_volume,
+ 		const char *device, const char *route);
+ 
++/* Follows volume and mute changes pushed by the service, reconnecting if the
++ * service goes away. volume and mute are NULL when an update omits them. */
++int spa_acp_ext_volume_monitor(struct spa_acp_ext_volume *ext_volume,
++		struct spa_loop_utils *loop_utils, spa_acp_ext_volume_changed_t changed,
++		void *data);
++
+ #endif /* ACP_EXT_VOLUME_H */
+diff --git a/spa/plugins/alsa/alsa-acp-device.c b/spa/plugins/alsa/alsa-acp-device.c
+index dbbd799..03f8c39 100644
+--- a/spa/plugins/alsa/alsa-acp-device.c
++++ b/spa/plugins/alsa/alsa-acp-device.c
+@@ -38,6 +38,7 @@
+ 
+ extern struct spa_i18n *acp_i18n;
+ extern struct spa_varlink *acp_varlink;
++extern struct spa_loop_utils *acp_loop_utils;
+ 
+ #define MAX_POLL	16
+ #define MAX_CHANNELS	SPA_AUDIO_MAX_CHANNELS
+@@ -1256,6 +1257,7 @@ impl_init(const struct spa_handle_factory *factory,
+ 	this->loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Loop);
+ 	acp_i18n = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_I18N);
+ 	acp_varlink = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Varlink);
++	acp_loop_utils = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_LoopUtils);
+ 	if (this->loop == NULL) {
+ 		spa_log_error(this->log, "a Loop interface is needed");
+ 		return -EINVAL;
+-- 
+2.55.0
+

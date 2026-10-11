@@ -28,9 +28,22 @@
         inputs.treefmt-nix.flakeModule
       ];
 
+      flake.lib =
+        let
+          patchesIn = dir: map (name: dir + "/${name}") (builtins.attrNames (builtins.readDir dir));
+        in
+        {
+          pipewirePatches = patchesIn ./patches/pipewire;
+          wireplumberPatches = patchesIn ./patches/wireplumber;
+        };
+
       perSystem =
         { config, pkgs, ... }:
         let
+          patched = import ./nix/patched.nix {
+            inherit pkgs;
+            inherit (inputs.self.lib) pipewirePatches wireplumberPatches;
+          };
           craneLib = inputs.crane.mkLib pkgs;
           commonArgs = {
             src = craneLib.cleanCargoSource ./.;
@@ -50,6 +63,7 @@
           packages = {
             default = denon-volume;
             inherit denon-volume;
+            inherit (patched) pipewire wireplumber;
           };
 
           checks = {

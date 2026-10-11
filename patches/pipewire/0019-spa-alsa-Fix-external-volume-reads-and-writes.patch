@@ -1,0 +1,474 @@
+From 0a498a082d139b4b1eb234fe0cf7359b6a3adccf Mon Sep 17 00:00:00 2001
+From: Alexis Williams <alexis@typedr.at>
+Date: Sun, 11 Oct 2026 14:35:14 -0700
+Subject: [PATCH] spa: alsa: Fix external volume reads and writes
+
+ReadVolume and ReadMute read their value from the wrong JSON iterator, the varlink client stopped parsing before "continues", absolute volume writes sent the previous volume, and a second write while one awaited its reply failed. Writes are now oneway, and the service connection is set up once per card.
+
+The varlink client also refuses calls once disconnected instead of writing to a closed fd, honours sync-call timeouts of a second or more, closes the socket when connect fails, and frees destroyed clients, which impl_clear otherwise loops on forever.
+---
+ spa/plugins/alsa/acp/acp.c        |  17 ++-
+ spa/plugins/alsa/acp/ext-volume.c | 190 +++++++++++++++---------------
+ spa/plugins/alsa/acp/ext-volume.h |   2 +-
+ spa/plugins/support/varlink.c     |  47 +++++---
+ 4 files changed, 138 insertions(+), 118 deletions(-)
+
+diff --git a/spa/plugins/alsa/acp/acp.c b/spa/plugins/alsa/acp/acp.c
+index a41c216..47943b4 100644
+--- a/spa/plugins/alsa/acp/acp.c
++++ b/spa/plugins/alsa/acp/acp.c
+@@ -1258,20 +1258,19 @@ static void init_ext_volume(pa_card *impl)
+ 	if (!impl->ext_volume_path)
+ 		return;
+ 
++	/* Called for every enabled device, but the service connection is
++	 * per card. */
++	if (card->ext_volume.client)
++		return;
++
+ 	if (!acp_varlink) {
+ 		pa_log_error("External volume control requires support.varlink = true");
+ 		return;
+ 	}
+ 
+ 	res = spa_acp_ext_volume_init(&card->ext_volume, acp_varlink, impl->ext_volume_path, impl->name, NULL);
+-	if (res < 0) {
+-		goto error;
+-	}
+-
+-	/* FIXME: Set up monitor callback */
+-
+-error:
+-	return;
++	if (res < 0)
++		spa_acp_ext_volume_destroy(&card->ext_volume);
+ }
+ 
+ uint32_t acp_card_find_best_profile_index(struct acp_card *card, const char *name)
+@@ -1465,7 +1464,7 @@ static void set_volume(pa_alsa_device *dev, const pa_cvolume *v)
+ 			/* External volume control by value */
+ 			if (spa_acp_ext_volume_write_volume_absolute(&impl->card.ext_volume,
+ 						impl->name, dev->active_port->name,
+-						&dev->real_volume) < 0) {
++						v) < 0) {
+ 				pa_log_error("Could not write volume");
+ 				return;
+ 			}
+diff --git a/spa/plugins/alsa/acp/ext-volume.c b/spa/plugins/alsa/acp/ext-volume.c
+index 6f08e7b..f5324a9 100644
+--- a/spa/plugins/alsa/acp/ext-volume.c
++++ b/spa/plugins/alsa/acp/ext-volume.c
+@@ -39,13 +39,82 @@ static struct spa_varlink_client_events client_events = {
+ 	.destroy = client_destroy,
+ };
+ 
+-static void check_reply(void *data, const char *params, const char *error,
+-		size_t len, bool continues)
++/* Points params at the reply's "parameters" object and returns its length,
++ * or a negative errno for an error reply. */
++static int reply_parameters(const char *reply, int len, const char **params)
+ {
+-	const char *method = (const char *) data;
++	struct spa_json it;
++	char key[64];
++	const char *val, *found = NULL;
++	int l, found_len = 0;
++
++	if (spa_json_begin_object(&it, reply, len) <= 0)
++		return -EINVAL;
++
++	while ((l = spa_json_object_next(&it, key, sizeof(key), &val)) > 0) {
++		if (spa_streq(key, "error")) {
++			pa_log_error("External volume control error: %.*s", l, val);
++			return -EIO;
++		}
++		if (spa_streq(key, "parameters") && spa_json_is_object(val, l)) {
++			found = val;
++			found_len = spa_json_container_len(&it, val, l);
++		}
++	}
++
++	if (!found)
++		return -ENOENT;
++
++	*params = found;
++	return found_len;
++}
++
++/* Reads the "volume" float array, scaled so that 1.0 is PA_VOLUME_NORM. */
++static int parse_volume(const char *params, int len, pa_cvolume *cvol)
++{
++	struct spa_json it, arr;
++	char key[64];
++	const char *val;
++	float v;
++	int l;
++
++	if (spa_json_begin_object(&it, params, len) <= 0)
++		return -EINVAL;
+ 
+-	if (error != NULL)
+-		pa_log_error("Error calling %s: %s", method, error);
++	while ((l = spa_json_object_next(&it, key, sizeof(key), &val)) > 0) {
++		if (!spa_streq(key, "volume") || !spa_json_is_array(val, l))
++			continue;
++
++		l = spa_json_container_len(&it, val, l);
++		if (spa_json_begin_array(&arr, val, l) <= 0)
++			return -EINVAL;
++
++		cvol->channels = 0;
++		while (cvol->channels < PA_CHANNELS_MAX && spa_json_get_float(&arr, &v) > 0)
++			cvol->values[cvol->channels++] = lrint(v * PA_VOLUME_NORM);
++
++		return cvol->channels > 0 ? 0 : -EINVAL;
++	}
++
++	return -ENOENT;
++}
++
++static int parse_mute(const char *params, int len, bool *mute)
++{
++	struct spa_json it;
++	char key[64];
++	const char *val;
++	int l;
++
++	if (spa_json_begin_object(&it, params, len) <= 0)
++		return -EINVAL;
++
++	while ((l = spa_json_object_next(&it, key, sizeof(key), &val)) > 0) {
++		if (spa_streq(key, "mute"))
++			return spa_json_parse_bool(val, l, mute) < 0 ? -EINVAL : 0;
++	}
++
++	return -ENOENT;
+ }
+ 
+ int
+@@ -150,11 +219,9 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
+ 		const char *device, const char *route, pa_cvolume *cvol)
+ {
+ 	struct spa_json_builder params_json;
+-	struct spa_json reply_json;
+ 	spa_autofree char *params = NULL;
+ 	spa_autofree char *reply = NULL;
+-	char key[64];
+-	const char *str;
++	const char *reply_params;
+ 	size_t len;
+ 	int res;
+ 
+@@ -167,60 +234,28 @@ spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
+ 
+ 	spa_json_builder_close(&params_json);
+ 
+-	res = spa_varlink_client_call_sync(ext_volume->client, METHOD_READ_VOLUME, params, &reply, DEFAULT_TIMEOUT_MSEC);
+-
++	res = spa_varlink_client_call_sync(ext_volume->client, METHOD_READ_VOLUME, params,
++			&reply, DEFAULT_TIMEOUT_MSEC);
+ 	if (res < 0) {
+ 		pa_log_error("Failed to query volume : %s", spa_strerror(res));
+ 		return res;
+ 	}
+ 
+-	spa_json_begin_object(&reply_json, reply, res);
+-
+-	while ((res = spa_json_object_next(&reply_json, key, sizeof(key), &str)) > 0) {
+-		struct spa_json sub = {0,}, volume_json;
+-		float v = 0;
+-
+-		if (spa_streq(key, "error")) {
+-			pa_log_error("Error reading volume: %s", str);
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		if (!spa_streq(key, "parameters"))
+-			continue;
+-
+-		if (spa_json_enter_object(&reply_json, &sub) < 0) {
+-			pa_log_error("Could not read volume parameters");
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		res = spa_json_object_find(&sub, "volume", &str);
+-
+-		if (res < 0) {
+-			pa_log_error("Could not read volume");
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		spa_json_enter_array(&sub, &volume_json);
+-
+-		cvol->channels = 0;
+-		while (spa_json_get_float(&volume_json, &v) && cvol->channels < PA_CHANNELS_MAX) {
+-			cvol->values[cvol->channels++] = lrint(v * PA_VOLUME_NORM);
+-		}
+-
+-		break;
++	if ((res = reply_parameters(reply, res, &reply_params)) < 0 ||
++			(res = parse_volume(reply_params, res, cvol)) < 0) {
++		pa_log_error("Could not read volume");
++		return res;
+ 	}
+ 
+-	res = 0;
+-done:
+-	return res;
++	return 0;
+ }
+ 
++/* Writes are sent oneway: the client allows a single outstanding reply per
++ * connection, so waiting for acknowledgements would make writes issued in
++ * quick succession, as from a dragged slider, fail. */
+ int
+ spa_acp_ext_volume_write_volume_absolute(struct spa_acp_ext_volume *ext_volume,
+-		const char *device, const char *route, pa_cvolume *cvol)
++		const char *device, const char *route, const pa_cvolume *cvol)
+ {
+ 	struct spa_json_builder params_json;
+ 	spa_autofree char *params = NULL;
+@@ -252,7 +287,7 @@ spa_acp_ext_volume_write_volume_absolute(struct spa_acp_ext_volume *ext_volume,
+ 	spa_json_builder_close(&params_json);
+ 
+ 	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_VOLUME_ABSOLUTE,
+-			params, false, false, check_reply, METHOD_WRITE_VOLUME_ABSOLUTE);
++			params, true, false, NULL, NULL);
+ 
+ 	if (res < 0) {
+ 		pa_log_error("Failed to write volume: %s", spa_strerror(res));
+@@ -282,7 +317,7 @@ spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
+ 	spa_json_builder_close(&params_json);
+ 
+ 	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_VOLUME_RELATIVE,
+-			params, false, false, check_reply, METHOD_WRITE_VOLUME_RELATIVE);
++			params, true, false, NULL, NULL);
+ 
+ 	if (res < 0) {
+ 		pa_log_error("Failed to write volume: %s", spa_strerror(res));
+@@ -297,11 +332,9 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
+ 		const char *device, const char *route, bool *mute)
+ {
+ 	struct spa_json_builder params_json;
+-	struct spa_json reply_json;
+ 	spa_autofree char *params = NULL;
+ 	spa_autofree char *reply = NULL;
+-	char key[64];
+-	const char *str;
++	const char *reply_params;
+ 	size_t len;
+ 	int res;
+ 
+@@ -314,47 +347,20 @@ spa_acp_ext_volume_read_mute(struct spa_acp_ext_volume *ext_volume,
+ 
+ 	spa_json_builder_close(&params_json);
+ 
+-	res = spa_varlink_client_call_sync(ext_volume->client, METHOD_READ_MUTE, params, &reply, DEFAULT_TIMEOUT_MSEC);
+-
++	res = spa_varlink_client_call_sync(ext_volume->client, METHOD_READ_MUTE, params,
++			&reply, DEFAULT_TIMEOUT_MSEC);
+ 	if (res < 0) {
+ 		pa_log_error("Failed to query mute state: %s", spa_strerror(res));
+ 		return res;
+ 	}
+ 
+-	spa_json_begin_object(&reply_json, reply, res);
+-
+-	while ((res = spa_json_object_next(&reply_json, key, sizeof(key), &str)) > 0) {
+-		struct spa_json sub = { 0, };
+-
+-		if (spa_streq(key, "error")) {
+-			pa_log_error("Error reading mute state: %s", str);
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		if (!spa_streq(key, "parameters"))
+-			continue;
+-
+-		if (spa_json_enter_object(&reply_json, &sub) < 0) {
+-			pa_log_error("Could not read mute parameters");
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		res = spa_json_object_find(&sub, "mute", &str);
+-
+-		if (res < 0 || spa_json_get_bool(&reply_json, mute) < 0) {
+-			pa_log_error("Could not read mute");
+-			res = -EINVAL;
+-			goto done;
+-		}
+-
+-		break;
++	if ((res = reply_parameters(reply, res, &reply_params)) < 0 ||
++			(res = parse_mute(reply_params, res, mute)) < 0) {
++		pa_log_error("Could not read mute");
++		return res;
+ 	}
+ 
+-	res = 0;
+-done:
+-	return res;
++	return 0;
+ }
+ 
+ int
+@@ -377,7 +383,7 @@ spa_acp_ext_volume_write_mute_value(struct spa_acp_ext_volume *ext_volume,
+ 	spa_json_builder_close(&params_json);
+ 
+ 	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_MUTE_VALUE,
+-			params, false, false, check_reply, METHOD_WRITE_MUTE_VALUE);
++			params, true, false, NULL, NULL);
+ 
+ 	if (res < 0) {
+ 		pa_log_error("Failed to write mute state: %s", spa_strerror(res));
+@@ -406,7 +412,7 @@ spa_acp_ext_volume_write_mute_toggle(struct spa_acp_ext_volume *ext_volume,
+ 	spa_json_builder_close(&params_json);
+ 
+ 	res = spa_varlink_client_call(ext_volume->client, METHOD_WRITE_MUTE_TOGGLE,
+-			params, false, false, check_reply, METHOD_WRITE_MUTE_TOGGLE);
++			params, true, false, NULL, NULL);
+ 
+ 	if (res < 0) {
+ 		pa_log_error("Failed to write mute toggle: %s", spa_strerror(res));
+diff --git a/spa/plugins/alsa/acp/ext-volume.h b/spa/plugins/alsa/acp/ext-volume.h
+index 6879ad3..ed026cd 100644
+--- a/spa/plugins/alsa/acp/ext-volume.h
++++ b/spa/plugins/alsa/acp/ext-volume.h
+@@ -30,7 +30,7 @@ int spa_acp_ext_volume_read_volume(struct spa_acp_ext_volume *ext_volume,
+ 		const char *device, const char *route, pa_cvolume *cvol);
+ 
+ int spa_acp_ext_volume_write_volume_absolute(struct spa_acp_ext_volume *ext_volume,
+-		const char *device, const char *route, pa_cvolume *cvol);
++		const char *device, const char *route, const pa_cvolume *cvol);
+ 
+ int spa_acp_ext_volume_write_volume_relative(struct spa_acp_ext_volume *ext_volume,
+ 		const char *device, const char *route, float step);
+diff --git a/spa/plugins/support/varlink.c b/spa/plugins/support/varlink.c
+index 99b5025..3b5e6fa 100644
+--- a/spa/plugins/support/varlink.c
++++ b/spa/plugins/support/varlink.c
+@@ -6,6 +6,7 @@
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
++#include <unistd.h>
+ 
+ #include <spa/support/log.h>
+ #include <spa/support/loop.h>
+@@ -114,6 +115,11 @@ client_call(void *object, const char *method, const char *params,
+ 	size_t len, pos = 0;
+ 	int res;
+ 
++	if (this->source == NULL) {
++		res = -ENOTCONN;
++		goto done;
++	}
++
+ 	if (this->reply_pending) {
+ 		res = -EINVAL;
+ 		goto done;
+@@ -161,6 +167,9 @@ client_call_sync(void *object, const char *method, const char *params,
+ 	size_t len, pos = 0;
+ 	int res = 0;
+ 
++	if (this->source == NULL)
++		return -ENOTCONN;
++
+ 	if (this->reply_pending || this->more_pending ||
+ 			(this->pos != 0 && this->avail != 0)) {
+ 		spa_log_error(impl->log, "Invalid state for sync call");
+@@ -175,7 +184,10 @@ client_call_sync(void *object, const char *method, const char *params,
+ 
+ 	fcntl(this->fd, F_SETFL, fcntl(this->fd, F_GETFL) & ~O_NONBLOCK);
+ 	if (timeout >= 0) {
+-		struct timeval tv = { .tv_sec = 0, .tv_usec = timeout * 1000 };
++		struct timeval tv = {
++			.tv_sec = timeout / 1000,
++			.tv_usec = (timeout % 1000) * 1000,
++		};
+ 		setsockopt(this->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+ 	}
+ 
+@@ -266,6 +278,9 @@ static void do_destroy(struct client *client)
+ 			destroy, SPA_VERSION_VARLINK_CLIENT_EVENTS);
+ 
+ 	spa_hook_list_clean(&client->listeners);
++
++	spa_list_remove(&client->link);
++	free(client);
+ }
+ 
+ static void
+@@ -282,35 +297,32 @@ process_message(struct client *this, const char *msg, size_t len)
+ 	struct spa_json json;
+ 	char key[64];
+ 	const char *val, *error = NULL, *params = NULL;
+-	int res;
++	int res, error_len = 0, params_len = 0;
+ 	bool continues = false;
+ 
+ 	spa_log_trace(impl->log, "got message: %.*s", (int)len, msg);
+ 
+-	spa_json_begin_object(&json, msg, len);
++	if (spa_json_begin_object(&json, msg, len) <= 0)
++		goto error;
+ 
++	/* Reply keys may arrive in any order, so read them all before
++	 * reporting; "continues" commonly follows "parameters". */
+ 	while ((res = spa_json_object_next(&json, key, sizeof(key), &val)) > 0) {
+ 		if (spa_streq(key, "error")) {
+-			len = spa_json_container_len(&json, val, res);
+ 			error = val;
+-			break;
+-		}
+-
+-		if (spa_streq(key, "continues")) {
+-			res = spa_json_get_bool(&json, &continues);
+-			if (res < 0)
++			error_len = res;
++		} else if (spa_streq(key, "continues")) {
++			if (spa_json_parse_bool(val, res, &continues) < 0)
+ 				goto error;
+-		}
+-
+-		if (spa_streq(key, "parameters")) {
+-			len = spa_json_container_len(&json, val, res);
++		} else if (spa_streq(key, "parameters")) {
+ 			params = val;
+-			break;
++			params_len = spa_json_container_len(&json, val, res);
+ 		}
+ 	}
+ 
+ 	if (this->cb)
+-		this->cb(this->cb_userdata, params,  error, len, continues);
++		this->cb(this->cb_userdata, params, error,
++				error ? error_len : params_len, continues);
+ 
+ 	if (!this->more_pending || !continues) {
+ 		/* We didn't ask for more, but server might send */
+@@ -425,6 +437,7 @@ impl_connect(void *object, const char *path)
+ 	client = calloc(1, sizeof(struct client));
+ 	if (client == NULL)
+ 		return NULL;
++	client->fd = -1;
+ 
+ 	socket_path = varlink_parse_path(path, &transport);
+ 	/* We only support UNIX sockets for now */
+@@ -480,6 +493,8 @@ impl_connect(void *object, const char *path)
+ 	return &client->client;
+ 
+ error:
++	if (client->fd >= 0)
++		close(client->fd);
+ 	free(client);
+ 	errno = -res;
+ 	return NULL;
+-- 
+2.55.0
+
