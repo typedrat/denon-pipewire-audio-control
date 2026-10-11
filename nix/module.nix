@@ -3,6 +3,7 @@ self:
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 let
@@ -78,8 +79,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    services.pipewire.package = patched.pipewire;
-    services.pipewire.wireplumber.package = patched.wireplumber;
+    services.pipewire.package = lib.mkDefault patched.pipewire;
+    services.pipewire.wireplumber.package = lib.mkDefault patched.wireplumber;
 
     services.pipewire.wireplumber.extraConfig."90-denon-volume" = {
       "context.properties"."support.varlink" = true;
@@ -110,7 +111,8 @@ in
       serviceConfig = {
         Type = "exec";
         Restart = "on-failure";
-        ExecStart = lib.escapeShellArgs (
+        RestartSec = 5;
+        ExecStart = utils.escapeSystemdExecArgs (
           [
             (lib.getExe' cfg.package "denon-volume")
             "--device"

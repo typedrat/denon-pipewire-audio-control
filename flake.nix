@@ -105,7 +105,43 @@
                   ];
                 };
               in
-              pkgs.writeText "denon-volume.service" eval.config.systemd.user.units."denon-volume.service".text;
+              let
+                inherit (inputs.nixpkgs) lib;
+                wp = eval.config.services.pipewire.wireplumber.extraConfig."90-denon-volume";
+                # The socket unit's %t is the user's runtime dir, /run/user/<uid>. WirePlumber is
+                # configured with that path spelled out, so the two must name the same socket.
+                expectedPath = "unix:/run/user/1000/denon-volume/org.pipewire.ExternalVolume";
+                rule = builtins.head wp."monitor.alsa.rules";
+                wpOk =
+                  assert lib.assertMsg (
+                    wp."context.properties"."support.varlink" == true
+                  ) "support.varlink must be true";
+                  assert lib.assertMsg (
+                    wp."wireplumber.settings"."monitor.alsa.enable-external-volume-control" == true
+                  ) "monitor.alsa.enable-external-volume-control must be true";
+                  assert lib.assertMsg (
+                    rule.actions.update-props."api.alsa.external-volume-control" == expectedPath
+                  ) "api.alsa.external-volume-control must be ${expectedPath}";
+                  true;
+              in
+              assert wpOk;
+              pkgs.runCommand "denon-volume-module-check"
+                {
+                  service = eval.config.systemd.user.units."denon-volume.service".text;
+                  socket = eval.config.systemd.user.units."denon-volume.socket".text;
+                  passAsFile = [
+                    "service"
+                    "socket"
+                  ];
+                }
+                ''
+                  # systemd quoting wraps every argument, so the flag/value pairs are quoted individually.
+                  grep -F '"--pc-input" "BD"' "$servicePath"
+                  grep -F '"--cap-mv" "70"' "$servicePath"
+                  grep -F 'RUST_LOG=info' "$servicePath"
+                  grep -F 'ListenStream=%t/denon-volume/org.pipewire.ExternalVolume' "$socketPath"
+                  cp "$servicePath" $out
+                '';
           };
 
           treefmt = {
