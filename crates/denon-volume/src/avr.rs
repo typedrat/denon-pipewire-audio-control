@@ -217,18 +217,20 @@ mod tests {
             port,
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(50),
-            heartbeat_interval: Duration::from_millis(100),
+            // Long enough that the idle deadline never fires in tests whose fake receiver
+            // stays quiet; the dead-peer test shortens it.
+            heartbeat_interval: Duration::from_secs(60),
         }
     }
 
     async fn with_daemon(
-        port: u16,
+        config: ConnectConfig,
         shared: Arc<Shared>,
         outbox: Arc<Outbox>,
         body: impl Future<Output = ()>,
     ) {
         tokio::select! {
-            () = run(config(port), shared, outbox) => unreachable!("run returned"),
+            () = run(config, shared, outbox) => unreachable!("run returned"),
             () = body => {}
         }
     }
@@ -272,7 +274,7 @@ mod tests {
     async fn seeds_state_from_queries() {
         let (listener, port) = listen().await;
         let (shared, outbox) = fixtures();
-        with_daemon(port, shared.clone(), outbox, async {
+        with_daemon(config(port), shared.clone(), outbox, async {
             let (mut sock, _) = listener.accept().await.unwrap();
             let sent = read_until(&mut sock, "MU?\r").await;
             for query in QUERIES {
@@ -297,7 +299,7 @@ mod tests {
     async fn sends_queued_commands() {
         let (listener, port) = listen().await;
         let (shared, outbox) = fixtures();
-        with_daemon(port, shared, outbox.clone(), async {
+        with_daemon(config(port), shared, outbox.clone(), async {
             let (mut sock, _) = listener.accept().await.unwrap();
             read_until(&mut sock, "MU?\r").await;
             outbox.push(Command::Volume(Mv::from_half_steps(121)));
@@ -312,7 +314,7 @@ mod tests {
     async fn reconnects_after_the_receiver_drops() {
         let (listener, port) = listen().await;
         let (shared, outbox) = fixtures();
-        with_daemon(port, shared.clone(), outbox, async {
+        with_daemon(config(port), shared.clone(), outbox, async {
             let (sock, _) = listener.accept().await.unwrap();
             wait_for(&shared, |s| s.connected).await;
             drop(sock);
@@ -330,7 +332,11 @@ mod tests {
     async fn drops_a_receiver_that_stops_answering() {
         let (listener, port) = listen().await;
         let (shared, outbox) = fixtures();
-        with_daemon(port, shared.clone(), outbox, async {
+        let config = ConnectConfig {
+            heartbeat_interval: Duration::from_millis(100),
+            ..config(port)
+        };
+        with_daemon(config, shared.clone(), outbox, async {
             let (_sock, _) = listener.accept().await.unwrap();
             wait_for(&shared, |s| s.connected).await;
             wait_for(&shared, |s| !s.connected).await;
