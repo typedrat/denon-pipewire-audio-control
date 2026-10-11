@@ -91,9 +91,15 @@ mod tests {
         assert_eq!(parse_line("ZMOFF"), Some(Event::Power(false)));
         assert_eq!(parse_line("PWSTANDBY"), Some(Event::Power(false)));
         assert_eq!(parse_line("SIBD"), Some(Event::Input("BD".into())));
-        assert_eq!(parse_line("SISAT/CBL"), Some(Event::Input("SAT/CBL".into())));
+        assert_eq!(
+            parse_line("SISAT/CBL"),
+            Some(Event::Input("SAT/CBL".into()))
+        );
         assert_eq!(parse_line("MV62"), Some(Event::Volume(Mv::from_whole(62))));
-        assert_eq!(parse_line("MV605"), Some(Event::Volume(Mv::from_half_steps(121))));
+        assert_eq!(
+            parse_line("MV605"),
+            Some(Event::Volume(Mv::from_half_steps(121)))
+        );
         assert_eq!(parse_line("MUON"), Some(Event::Mute(true)));
         assert_eq!(parse_line("MUOFF"), Some(Event::Mute(false)));
     }
@@ -110,7 +116,10 @@ mod tests {
     #[test]
     fn formats_commands() {
         assert_eq!(Command::Volume(Mv::from_whole(62)).to_string(), "MV62");
-        assert_eq!(Command::Volume(Mv::from_half_steps(121)).to_string(), "MV605");
+        assert_eq!(
+            Command::Volume(Mv::from_half_steps(121)).to_string(),
+            "MV605"
+        );
         assert_eq!(Command::Mute(true).to_string(), "MUON");
         assert_eq!(Command::Mute(false).to_string(), "MUOFF");
     }
