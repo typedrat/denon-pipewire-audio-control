@@ -32,12 +32,17 @@ Valve's `cec-audio-control` reference server.
 1. **Protocol: telnet.** It supports absolute volume (`MVnn` / `MVnn5` for
    0.5 dB steps) and explicit mute (`MUON`/`MUOFF`), and it pushes every state
    change without polling.
-2. **Volume mapping: PipeWire-cubic ↔ dB, capped.** For a PipeWire volume
-   fraction `v` (1.0 = 100%), the receiver level is
-   `dB = cap_dB + 60·log10(v)`, where `MV = dB + 80`. The result is rounded to
-   0.5 dB, clamped to `[MV 0, cap]`, and `v = 0` maps to MV 0. The default cap
-   is **MV 70 (−10 dB)**, so the current MV62 shows as **74%**. The inverse is
-   `v = 10^((MV − 80 − cap_dB)/60)`.
+2. **Volume mapping: the display number, capped.** The PipeWire fraction is
+   `v = MV / 100`, so the slider percentage reads the same as the receiver's
+   display: MV62 is 62% and MV60.5 is 60.5%. `MV` is already linear in dB, and
+   PipeWire's software volume stays at 100% for this device, so no cubic curve
+   is applied. Writes round to the nearest 0.5 step and clamp to
+   `[MV 0, cap]`, and `v ≤ 0` maps to MV 0. The default cap is
+   **MV 70 (−10 dB)**: dragging past 70% leaves the receiver at MV70, and the
+   slider settles back to 70%. A level above the cap set on the receiver
+   itself reads back as it is. Two side effects are accepted: pavucontrol's
+   dB label (computed from its cubic curve) won't match the receiver, and a
+   5% volume-key step is a 5 dB change.
 3. **Live sync: patch ACP to call `Monitor()`.** Valve's client never calls it.
 4. **Input gating.** Writes take effect only while the receiver is `PWON` and
    `SI` equals the configured PC input. Otherwise the write is dropped and the
@@ -70,7 +75,8 @@ denon-pipewire-audio-control/
 
 ### `scale`
 
-Pure functions `to_mv(v, cap) -> Mv` and `from_mv(mv, cap) -> f64`. `Mv` holds
+Pure functions `to_mv(v, cap) -> Mv` (`round(v·200)` half steps, clamped to
+`cap`) and `from_mv(mv) -> f64` (half steps ÷ 200). `Mv` holds
 half-steps as an integer (MV62 = 124, MV60.5 = 121) and formats as the wire
 form (`62`, `605`, `00`). No I/O.
 
@@ -179,9 +185,9 @@ patched builds can be checked alone.
 
 ## Testing
 
-- **`scale`:** unit tests for the round trip (`from_mv(to_mv(v))` stays within
-  one half-step), 0.736 → MV62, 1.0 → MV70, 0 → MV0, the clamp above the cap,
-  and the wire formatting `605` / `00`.
+- **`scale`:** unit tests for the round trip (every level up to the cap maps
+  back to itself), 0.62 ↔ MV62, 0.613 → MV61.5, 0.9 → MV70 (the cap), 0 → MV0,
+  MV80 reading as 0.80, and the wire formatting `605` / `00`.
 - **`avr`:** tokio tests against an in-process fake Denon TCP server. They
   cover partial-line buffering, half-step parsing, ignoring `MVMAX`,
   coalescing, the 50 ms spacing, and reconnect after the server drops.

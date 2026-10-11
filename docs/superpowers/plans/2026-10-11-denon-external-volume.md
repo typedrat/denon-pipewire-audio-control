@@ -15,7 +15,7 @@
 - Rust edition `2024`; the virtual workspace manifest spells out `resolver = "3"`.
 - Flake built with flake-parts; Rust built with crane; dev shell from numtide/devshell; formatting by treefmt-nix (nixfmt + rustfmt).
 - Varlink interface `org.pipewire.ExternalVolume`, exactly as in Valve's IDL (`GetCapabilities`, `ReadVolume`, `ReadMute`, `Monitor`, `WriteVolumeAbsolute`, `WriteVolumeRelative`, `WriteMuteValue`, `WriteMuteToggle`).
-- Volume mapping: `dB = cap_dB + 60·log10(v)`, `MV = dB + 80`, rounded to 0.5 dB, clamped to `[MV 0, cap]`; `v ≤ 0` → MV 0. Default cap **MV 70** (−10 dB).
+- Volume mapping: PipeWire fraction `v = MV / 100`, so the slider percentage equals the receiver's display (MV60 = 60%, MV60.5 = 60.5%). Writes round to the nearest half step and clamp to `[MV 0, cap]`; `v ≤ 0` → MV 0. Default cap **MV 70** (−10 dB). Levels above the cap set on the receiver read back as they are.
 - Writes reach the receiver only while it is connected, powered on (`ZMON`) and on the configured PC input; otherwise they are dropped and the real state is re-published.
 - Default device/route: `alsa_card.pci-0000_01_00.1` / `hdmi-output-0` (measured on this machine). PC input is `BD` here, but it is a required option with no default.
 - Socket path: `$XDG_RUNTIME_DIR/denon-volume/org.pipewire.ExternalVolume`.
@@ -269,10 +269,10 @@ git commit -m "Scaffold denon-volume crate and flake"
 **Interfaces:**
 - Produces:
   - `pub struct Mv` (Copy, Eq, Ord, Hash, Debug)
-  - `Mv::ZERO`, `Mv::from_half_steps(u16) -> Mv`, `Mv::from_whole(u16) -> Mv`, `Mv::half_steps(self) -> u16`, `Mv::db(self) -> f64`, `Mv::parse(&str) -> Option<Mv>`
+  - `Mv::ZERO`, `Mv::from_half_steps(u16) -> Mv`, `Mv::from_whole(u16) -> Mv`, `Mv::half_steps(self) -> u16`, `Mv::parse(&str) -> Option<Mv>`
   - `impl Display for Mv` (wire digits: `62`, `605`, `00`, `005`)
   - `pub fn to_mv(v: f64, cap: Mv) -> Mv`
-  - `pub fn from_mv(mv: Mv, cap: Mv) -> f64`
+  - `pub fn from_mv(mv: Mv) -> f64`
 
 - [ ] **Step 1: Write the failing tests** in `crates/denon-volume/src/scale.rs`
 
@@ -303,14 +303,17 @@ mod tests {
     }
 
     #[test]
-    fn current_level_is_74_percent() {
-        assert_eq!(to_mv(0.736, CAP), Mv::from_whole(62));
-        assert!((from_mv(Mv::from_whole(62), CAP) - 0.7356).abs() < 1e-3);
+    fn percent_is_the_display_number() {
+        assert_eq!(from_mv(Mv::from_whole(62)), 0.62);
+        assert_eq!(from_mv(Mv::from_half_steps(121)), 0.605);
+        assert_eq!(to_mv(0.62, CAP), Mv::from_whole(62));
+        assert_eq!(to_mv(0.613, CAP), Mv::from_half_steps(123));
     }
 
     #[test]
-    fn full_scale_is_the_cap() {
-        assert_eq!(to_mv(1.0, CAP), CAP);
+    fn writes_stop_at_the_cap() {
+        assert_eq!(to_mv(0.70, CAP), CAP);
+        assert_eq!(to_mv(0.90, CAP), CAP);
         assert_eq!(to_mv(1.5, CAP), CAP);
     }
 
@@ -320,20 +323,20 @@ mod tests {
         assert_eq!(to_mv(-1.0, CAP), Mv::ZERO);
         assert_eq!(to_mv(f64::NAN, CAP), Mv::ZERO);
         assert_eq!(to_mv(1e-6, CAP), Mv::ZERO);
-        assert_eq!(from_mv(Mv::ZERO, CAP), 0.0);
+        assert_eq!(from_mv(Mv::ZERO), 0.0);
     }
 
     #[test]
     fn every_step_round_trips() {
         for half_steps in 1..=CAP.half_steps() {
             let mv = Mv::from_half_steps(half_steps);
-            assert_eq!(to_mv(from_mv(mv, CAP), CAP), mv, "{mv}");
+            assert_eq!(to_mv(from_mv(mv), CAP), mv, "{mv}");
         }
     }
 
     #[test]
-    fn levels_above_the_cap_read_above_one() {
-        assert!(from_mv(Mv::from_whole(80), CAP) > 1.0);
+    fn levels_above_the_cap_read_as_they_are() {
+        assert_eq!(from_mv(Mv::from_whole(80)), 0.80);
     }
 }
 ```
@@ -350,9 +353,10 @@ Expected: compile errors (`Mv`, `to_mv` and `from_mv` are not defined).
 ```rust
 //! Conversion between PipeWire's volume fraction and the receiver's master volume.
 //!
-//! PipeWire volumes are cubic: a fraction `v` is an amplitude of `v³`, which is
-//! `20·log10(v³) = 60·log10(v)` dB. The receiver's `MV` scale is dB offset by 80 (MV 80 is
-//! 0 dB) in half-dB steps. `cap` is the level that 100% maps to.
+//! The fraction is the receiver's `MV` number divided by 100, so PipeWire's percentage reads
+//! the same as the receiver's display. `MV` is already linear in dB (MV 80 is 0 dB, in
+//! half-dB steps), which is why PipeWire's usual cubic curve isn't applied: its software
+//! volume stays at 100% for this device, so the curve would only distort the slider.
 
 use std::fmt;
 
@@ -373,10 +377,6 @@ impl Mv {
 
     pub const fn half_steps(self) -> u16 {
         self.0
-    }
-
-    pub fn db(self) -> f64 {
-        f64::from(self.0) / 2.0 - 80.0
     }
 
     /// Parses the digits after `MV`: two digits, optionally followed by `5` for a half step.
@@ -407,19 +407,12 @@ pub fn to_mv(v: f64, cap: Mv) -> Mv {
     if v.is_nan() || v <= 0.0 {
         return Mv::ZERO;
     }
-    let db = cap.db() + 60.0 * v.log10();
-    let half_steps = ((db + 80.0) * 2.0).round().clamp(0.0, f64::from(cap.0));
+    let half_steps = (v * 200.0).round().clamp(0.0, f64::from(cap.0));
     Mv(half_steps as u16)
 }
 
-/// Maps a receiver level back to a PipeWire fraction. Levels above `cap`, set from the
-/// receiver itself, come out above 1.0.
-pub fn from_mv(mv: Mv, cap: Mv) -> f64 {
-    if mv == Mv::ZERO {
-        0.0
-    } else {
-        10f64.powf((mv.db() - cap.db()) / 60.0)
-    }
+pub fn from_mv(mv: Mv) -> f64 {
+    f64::from(mv.0) / 200.0
 }
 ```
 
@@ -621,7 +614,7 @@ git commit -m "Add Denon telnet protocol parsing"
 - Consumes: `protocol::Event`, `scale::{Mv, to_mv, from_mv}`.
 - Produces:
   - `pub struct AvrState { pub connected: bool, pub power: Option<bool>, pub input: Option<String>, pub mv: Option<Mv>, pub mute: Option<bool>, /* private: requested, generation */ }` (Debug, Clone, Default, PartialEq)
-  - `AvrState::volume(&self, cap: Mv) -> Option<f64>`, `AvrState::active(&self, pc_input: &str) -> bool`
+  - `AvrState::volume(&self) -> Option<f64>`, `AvrState::active(&self, pc_input: &str) -> bool`
   - `pub struct Shared` with:
     - `new(pc_input: impl Into<String>, cap: Mv) -> Shared`
     - `cap(&self) -> Mv`, `subscribe(&self) -> watch::Receiver<AvrState>`, `snapshot(&self) -> AvrState`
@@ -649,7 +642,7 @@ mod tests {
 
     #[test]
     fn unknown_level_has_no_volume() {
-        assert_eq!(Shared::new("BD", CAP).snapshot().volume(CAP), None);
+        assert_eq!(Shared::new("BD", CAP).snapshot().volume(), None);
     }
 
     #[test]
@@ -669,21 +662,21 @@ mod tests {
     #[test]
     fn confirmed_request_reports_the_exact_fraction() {
         let shared = on_pc_input();
-        let mv = shared.request_volume(0.9).expect("active");
-        assert_eq!(mv, Mv::from_half_steps(135));
+        let mv = shared.request_volume(0.613).expect("active");
+        assert_eq!(mv, Mv::from_half_steps(123));
         shared.apply(Event::Volume(mv));
-        assert_eq!(shared.snapshot().volume(CAP), Some(0.9));
+        assert_eq!(shared.snapshot().volume(), Some(0.613));
         shared.apply(Event::Volume(Mv::from_whole(60)));
-        assert_eq!(shared.snapshot().volume(CAP), Some(scale::from_mv(Mv::from_whole(60), CAP)));
+        assert_eq!(shared.snapshot().volume(), Some(0.60));
     }
 
     #[test]
-    fn requests_above_full_scale_are_clamped() {
+    fn requests_above_the_cap_are_clamped() {
         let shared = on_pc_input();
-        let mv = shared.request_volume(1.4).expect("active");
+        let mv = shared.request_volume(0.9).expect("active");
         assert_eq!(mv, CAP);
         shared.apply(Event::Volume(mv));
-        assert_eq!(shared.snapshot().volume(CAP), Some(1.0));
+        assert_eq!(shared.snapshot().volume(), Some(0.70));
     }
 
     #[test]
@@ -691,7 +684,7 @@ mod tests {
         let shared = on_pc_input();
         let mut rx = shared.subscribe();
         rx.borrow_and_update();
-        let mv = shared.request_volume(0.9).expect("active");
+        let mv = shared.request_volume(0.613).expect("active");
         assert!(!rx.has_changed().unwrap());
         shared.apply(Event::Volume(mv));
         assert!(rx.has_changed().unwrap());
@@ -759,11 +752,11 @@ pub struct AvrState {
 }
 
 impl AvrState {
-    pub fn volume(&self, cap: Mv) -> Option<f64> {
+    pub fn volume(&self) -> Option<f64> {
         let mv = self.mv?;
         Some(match self.requested {
             Some((requested, v)) if requested == mv => v,
-            _ => scale::from_mv(mv, cap),
+            _ => scale::from_mv(mv),
         })
     }
 
@@ -828,7 +821,9 @@ impl Shared {
                 s.generation += 1;
                 return true;
             }
-            let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+            // Clamping here, not just in to_mv, makes an over-cap request echo back as the
+            // cap, so PipeWire's slider settles where the receiver actually is.
+            let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, scale::from_mv(self.cap)) };
             let mv = scale::to_mv(v, self.cap);
             s.requested = Some((mv, v));
             target = Some(mv);
@@ -1442,7 +1437,7 @@ use std::time::Duration;
 
 use denon_volume::avr::Outbox;
 use denon_volume::protocol::{Command, Event};
-use denon_volume::scale::{self, Mv};
+use denon_volume::scale::Mv;
 use denon_volume::service::ExternalVolume;
 use denon_volume::state::Shared;
 use denon_volume::types::{Capabilities, ExternalVolumeError, MonitorUpdate, Mute, Volume};
@@ -1564,7 +1559,7 @@ async fn reads_need_a_known_state() {
         );
         h.receiver_on_pc();
         let volume = conn.read_volume(DEVICE, ROUTE).await.unwrap().unwrap();
-        assert_eq!(volume.volume, [scale::from_mv(Mv::from_whole(62), CAP)]);
+        assert_eq!(volume.volume, [0.62]);
         assert!(!conn.read_mute(DEVICE, ROUTE).await.unwrap().unwrap().mute);
         assert_eq!(
             conn.read_volume(DEVICE, "hdmi-output-1").await.unwrap(),
@@ -1579,17 +1574,23 @@ async fn writes_on_the_pc_input_reach_the_outbox() {
     with_service(|h| async move {
         h.receiver_on_pc();
         let mut conn = unix::connect(&h.path).await.unwrap();
-        conn.write_volume_absolute(DEVICE, ROUTE, &[0.9, 0.9])
+        conn.write_volume_absolute(DEVICE, ROUTE, &[0.613, 0.613])
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(h.outbox.take(), Some(Command::Volume(Mv::from_half_steps(135))));
+        assert_eq!(h.outbox.take(), Some(Command::Volume(Mv::from_half_steps(123))));
         conn.write_mute_value(DEVICE, ROUTE, true).await.unwrap().unwrap();
         assert_eq!(h.outbox.take(), Some(Command::Mute(true)));
 
-        h.shared.apply(Event::Volume(Mv::from_half_steps(135)));
+        h.shared.apply(Event::Volume(Mv::from_half_steps(123)));
         let volume = conn.read_volume(DEVICE, ROUTE).await.unwrap().unwrap();
-        assert_eq!(volume.volume, [0.9]);
+        assert_eq!(volume.volume, [0.613]);
+
+        conn.write_volume_absolute(DEVICE, ROUTE, &[0.9])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.outbox.take(), Some(Command::Volume(CAP)));
     })
     .await;
 }
@@ -1625,11 +1626,11 @@ async fn monitor_streams_receiver_changes() {
         h.receiver_on_pc();
         let first = next_update(&mut stream).await;
         assert_eq!(first.route, ROUTE);
-        assert_eq!(first.volume, [scale::from_mv(Mv::from_whole(62), CAP)]);
+        assert_eq!(first.volume, [0.62]);
 
         h.shared.apply(Event::Volume(Mv::from_whole(60)));
         let update = next_update(&mut stream).await;
-        assert_eq!(update.volume, [scale::from_mv(Mv::from_whole(60), CAP)]);
+        assert_eq!(update.volume, [0.60]);
 
         h.shared.apply(Event::Mute(true));
         assert_eq!(next_update(&mut stream).await.mute, Some(true));
@@ -1663,6 +1664,7 @@ use zlink::{Reply, service};
 
 use crate::avr::Outbox;
 use crate::protocol::Command;
+use crate::scale;
 use crate::state::Shared;
 use crate::types::{
     Capabilities, ExternalVolumeError, MonitorUpdate, Mute, Volume, VolumeRange, VolumeStepRange,
@@ -1741,8 +1743,8 @@ impl ExternalVolume {
             read_balance: false,
             volume_range: VolumeRange {
                 min: 0.0,
-                max: 1.0,
-                step: 0.0,
+                max: scale::from_mv(self.shared.cap()),
+                step: 0.005,
             },
             write_volume_absolute: true,
             write_volume_relative: false,
@@ -1761,7 +1763,7 @@ impl ExternalVolume {
         let volume = self
             .shared
             .snapshot()
-            .volume(self.shared.cap())
+            .volume()
             .ok_or(ExternalVolumeError::OperationUnsupported)?;
         Ok(Volume {
             volume: vec![volume],
@@ -1839,14 +1841,13 @@ impl ExternalVolume {
             warn!(device, expected = %self.device, "monitor for an unknown device");
         }
         let route = self.route.clone();
-        let cap = self.shared.cap();
         WatchStream::new(self.shared.subscribe())
             .filter(|s| future::ready(s.mv.is_some()))
             .take(if more { usize::MAX } else { 1 })
             .map(move |s| {
                 let update = MonitorUpdate {
                     route: route.clone(),
-                    volume: s.volume(cap).into_iter().collect(),
+                    volume: s.volume().into_iter().collect(),
                     mute: s.mute,
                 };
                 Reply::new(Some(update)).set_continues(more.then_some(true))
@@ -2083,7 +2084,7 @@ varlinkctl call $S $I.ReadVolume '{"device":"alsa_card.pci-0000_01_00.1","route"
 varlinkctl call $S $I.ReadMute '{"device":"alsa_card.pci-0000_01_00.1","route":"hdmi-output-0"}'
 varlinkctl introspect $S $I
 ```
-Expected: capabilities with `readVolume: true` etc.; a volume that matches the receiver's display (`from_mv`; e.g. MV62 → ≈0.7356); `mute: false`; and an IDL listing all eight methods.
+Expected: capabilities with `readVolume: true` etc.; a volume equal to the receiver's display divided by 100 (e.g. MV62 → 0.62); `mute: false`; and an IDL listing all eight methods.
 
 Then run `varlinkctl call --more $S $I.Monitor '{"device":"alsa_card.pci-0000_01_00.1"}'` and **ask the user to turn the receiver's volume knob a couple of clicks**. Expected: one JSON line per click. **Do not issue write calls without the user's go-ahead**, because they change the receiver's real volume. If the user approves, write the level that `ReadVolume` just returned (a no-op): `varlinkctl call $S $I.WriteVolumeAbsolute '{"device":"…","route":"hdmi-output-0","volume":[<that value>]}'`.
 
@@ -3002,9 +3003,9 @@ Follow nix-config's own conventions for where host modules and inputs live; read
 
 1. `systemctl --user status denon-volume` → active; the journal shows `connected to receiver`.
 2. `journalctl --user -u wireplumber -b | grep -i 'external volume'` → shows the connection; no `requires support.varlink` error.
-3. `wpctl get-volume @DEFAULT_AUDIO_SINK@` → matches the receiver (MV62 ≈ 0.74 at a 70 cap).
+3. `wpctl get-volume @DEFAULT_AUDIO_SINK@` → equals the receiver's display ÷ 100 (MV62 → 0.62).
 4. **Ask the user** to turn the receiver knob → `watch -n0.5 wpctl get-volume @DEFAULT_AUDIO_SINK@` follows within about a second.
-5. **Ask the user** to drag the slider in pavucontrol → the receiver's display tracks it; releasing leaves the receiver at the slider's position. Dragging to 100% stops at MV70.
+5. **Ask the user** to drag the slider in pavucontrol → the receiver's display tracks it; releasing leaves the receiver at the slider's position. Dragging past 70% stops the receiver at MV70 and the slider settles back at 70%.
 6. Mute from pavucontrol → the receiver shows MUTE; unmuting on the remote → pavucontrol updates.
 7. **Ask the user** to switch the receiver to another input and move the slider → the receiver doesn't change and the slider snaps back. Switch back to BD.
 8. `systemctl --user restart denon-volume` → within about 2 s the knob → slider sync works again (reconnect timer).
