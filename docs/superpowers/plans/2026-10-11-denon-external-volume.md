@@ -2042,6 +2042,7 @@ async fn main() -> anyhow::Result<()> {
         port: protocol::PORT,
         initial_backoff: Duration::from_secs(1),
         max_backoff: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_secs(30),
     };
 
     let (listener, bound) = match activated_listener()? {
