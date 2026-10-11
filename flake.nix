@@ -43,6 +43,8 @@
           wireplumberPatches = patchesIn ./patches/wireplumber;
         };
 
+      flake.nixosModules.default = import ./nix/module.nix inputs.self;
+
       perSystem =
         { config, pkgs, ... }:
         let
@@ -82,6 +84,28 @@
               }
             );
             test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+
+            nixos-module =
+              let
+                eval = inputs.nixpkgs.lib.nixosSystem {
+                  modules = [
+                    inputs.self.nixosModules.default
+                    {
+                      nixpkgs.hostPlatform = pkgs.stdenv.hostPlatform.system;
+                      boot.isContainer = true;
+                      system.stateVersion = "26.05";
+                      services.pipewire.enable = true;
+                      services.denon-volume = {
+                        enable = true;
+                        uid = 1000;
+                        alsaDevice = "alsa_card.pci-0000_01_00.1";
+                        pcInput = "BD";
+                      };
+                    }
+                  ];
+                };
+              in
+              pkgs.writeText "denon-volume.service" eval.config.systemd.user.units."denon-volume.service".text;
           };
 
           treefmt = {
