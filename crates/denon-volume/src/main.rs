@@ -48,7 +48,7 @@ struct Args {
 }
 
 fn parse_cap(s: &str) -> Result<Mv, String> {
-    let level: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    let level: f64 = s.parse().map_err(|_| format!("not a number: {s}"))?;
     let half_steps = level * 2.0;
     if !(0.0..=196.0).contains(&half_steps) || half_steps.fract() != 0.0 {
         return Err("must be between 0 and 98 in steps of 0.5".to_owned());
@@ -58,6 +58,7 @@ fn parse_cap(s: &str) -> Result<Mv, String> {
 
 /// The listener systemd passed in, if this process was socket-activated.
 fn activated_listener() -> anyhow::Result<Option<zlink::unix::Listener>> {
+    // Child processes inherit these variables, so they only count when they name this process.
     let for_us = std::env::var("LISTEN_PID")
         .ok()
         .and_then(|pid| pid.parse::<u32>().ok())
@@ -72,7 +73,9 @@ fn activated_listener() -> anyhow::Result<Option<zlink::unix::Listener>> {
     // SAFETY: systemd hands over the first socket as fd 3, and nothing else in this process
     // opens or owns it.
     let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-    listener.set_nonblocking(true)?;
+    listener
+        .set_nonblocking(true)
+        .context("making the activated socket non-blocking")?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     Ok(Some(zlink::unix::Listener::from(listener)))
 }
@@ -80,8 +83,17 @@ fn activated_listener() -> anyhow::Result<Option<zlink::unix::Listener>> {
 fn default_socket() -> anyhow::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
     let dir = PathBuf::from(runtime).join("denon-volume");
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {dir:?}"))?;
     Ok(dir.join("org.pipewire.ExternalVolume"))
+}
+
+/// Removes the socket file it owns when dropped.
+struct SocketGuard(PathBuf);
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn bind(path: &Path) -> anyhow::Result<zlink::unix::Listener> {
@@ -89,6 +101,11 @@ fn bind(path: &Path) -> anyhow::Result<zlink::unix::Listener> {
         anyhow::ensure!(
             meta.file_type().is_socket(),
             "{path:?} exists and isn't a socket"
+        );
+        // A connect that succeeds means a live server owns the path; only a refused one is stale.
+        anyhow::ensure!(
+            std::os::unix::net::UnixStream::connect(path).is_err(),
+            "another denon-volume is already serving {path:?}"
         );
         std::fs::remove_file(path)?;
     }
@@ -119,34 +136,35 @@ async fn main() -> anyhow::Result<()> {
         heartbeat_interval: Duration::from_secs(30),
     };
 
-    let (listener, bound) = match activated_listener()? {
-        Some(listener) => (listener, None),
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    let (listener, _guard) = match activated_listener()? {
+        Some(listener) => {
+            info!("serving org.pipewire.ExternalVolume on socket-activated socket");
+            (listener, None)
+        }
         None => {
             let path = match args.socket {
                 Some(path) => path,
                 None => default_socket()?,
             };
-            (bind(&path)?, Some(path))
+            let listener = bind(&path)?;
+            info!(socket = ?path, "serving org.pipewire.ExternalVolume");
+            (listener, Some(SocketGuard(path)))
         }
     };
-    info!(socket = ?bound, "serving org.pipewire.ExternalVolume");
 
     let service = ExternalVolume::new(args.device, args.route, shared.clone(), outbox.clone());
     let server = zlink::Server::new(listener, service);
 
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
     tokio::select! {
         result = server.run() => result.context("varlink server failed")?,
         () = avr::run(config, shared, outbox) => {}
         _ = sigint.recv() => {}
         _ = sigterm.recv() => {}
         _ = sighup.recv() => {}
-    }
-
-    if let Some(path) = bound {
-        let _ = std::fs::remove_file(path);
     }
     Ok(())
 }
@@ -168,5 +186,25 @@ mod tests {
         assert!(parse_cap("99").is_err());
         assert!(parse_cap("-1").is_err());
         assert!(parse_cap("loud").is_err());
+    }
+
+    #[test]
+    fn bind_refuses_a_live_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        let _live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let Err(err) = bind(&path) else {
+            panic!("bind should refuse a live socket");
+        };
+        assert!(err.to_string().contains("already serving"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bind_replaces_a_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        assert!(bind(&path).is_ok());
     }
 }
